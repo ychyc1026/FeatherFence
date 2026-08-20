@@ -7,7 +7,7 @@ use crate::config::{self, FenceKind};
 use crate::fence;
 use crate::fencelife::reserve_desktop_icons;
 use crate::watcher;
-use crate::Global;
+use crate::{with_global, Global};
 
 use super::{CollectionStats, FileCandidate};
 
@@ -109,9 +109,66 @@ fn queue_new_shortcut_candidate(
     }
 }
 
+/// Pause automatic shortcut collection across DoDragDrop's nested message loop. OLE can dispatch
+/// our timer while the drag is still active, so merely filtering after DoDragDrop returns is too
+/// late: the shortcut may already have been moved back into a fence by then.
+pub(crate) fn begin_shortcut_dragout() {
+    with_global(|g| {
+        g.shortcut_dragout_active = true;
+        g.shortcut_dragout_events.clear();
+        g.shortcut_ignore_until = None;
+    });
+}
+
+pub(crate) fn finish_shortcut_dragout(dropped_on_desktop: bool) {
+    with_global(|g| {
+        g.shortcut_dragout_active = false;
+        let held: Vec<PathBuf> = g.shortcut_dragout_events.drain().collect();
+        if dropped_on_desktop {
+            for path in held {
+                if is_shortcut(&path) {
+                    g.shortcut_pending.remove(&path);
+                    g.shortcut_seen.insert(path);
+                }
+            }
+            // File-system delivery can trail DoDragDrop slightly. Ignore only this short tail;
+            // existing desktop shortcuts stay in `seen`, and future genuine creations resume.
+            g.shortcut_ignore_until = Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            );
+            crate::dlog("[shortcut] suppressed desktop auto-collection after fence drag-out");
+        } else {
+            for path in held {
+                queue_new_shortcut_candidate(
+                    &mut g.shortcut_seen,
+                    &mut g.shortcut_pending,
+                    path,
+                );
+            }
+            g.shortcut_ignore_until = None;
+        }
+    });
+}
+
 fn ingest_shortcut_events(g: &mut Global) {
+    let now = std::time::Instant::now();
+    let ignore_tail = g.shortcut_ignore_until.is_some_and(|until| now <= until);
+    if g.shortcut_ignore_until.is_some() && !ignore_tail {
+        g.shortcut_ignore_until = None;
+    }
     while let Ok(paths) = g.desktop_rx.try_recv() {
         for path in paths {
+            if g.shortcut_dragout_active {
+                if is_shortcut(&path) {
+                    g.shortcut_dragout_events.insert(path);
+                }
+                continue;
+            }
+            if ignore_tail && is_shortcut(&path) {
+                g.shortcut_pending.remove(&path);
+                g.shortcut_seen.insert(path);
+                continue;
+            }
             queue_new_shortcut_candidate(&mut g.shortcut_seen, &mut g.shortcut_pending, path);
         }
     }

@@ -81,6 +81,12 @@ pub struct Global {
     pub desktop_rx: Receiver<Vec<PathBuf>>,
     pub shortcut_seen: HashSet<PathBuf>,
     pub shortcut_pending: HashMap<PathBuf, FileCandidate>,
+    /// While a fence item is being dragged, hold desktop shortcut notifications. If the drop
+    /// ends on the desktop, those notifications belong to the user's drag-out and must not be
+    /// fed straight back into automatic shortcut collection.
+    pub shortcut_dragout_active: bool,
+    pub shortcut_dragout_events: HashSet<PathBuf>,
+    pub shortcut_ignore_until: Option<std::time::Instant>,
     pub download_rx: Receiver<Vec<String>>,
     pub download_seen: HashSet<PathBuf>,
     pub download_pending: HashMap<PathBuf, FileCandidate>,
@@ -690,6 +696,9 @@ fn main() {
         desktop_rx,
         shortcut_seen,
         shortcut_pending: HashMap::new(),
+        shortcut_dragout_active: false,
+        shortcut_dragout_events: HashSet::new(),
+        shortcut_ignore_until: None,
         download_rx,
         download_seen,
         download_pending: HashMap::new(),

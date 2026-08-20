@@ -1,10 +1,11 @@
 //! 避让栅栏：把 Explorer 桌面 ListView 中落在栅栏矩形下的图标移到空闲网格。
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::mem::size_of;
+use std::mem::{size_of, ManuallyDrop};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 撤销窗口：图标/栅栏被搬移后 1 分钟内可「撤销并关闭避让」,超时记录作废,
 /// 防止长期开启避让时 static 历史无限累积。
@@ -19,21 +20,35 @@ static ICON_HISTORY: Mutex<Option<HashMap<u32, (POINT, u64)>>> = Mutex::new(None
 static FENCE_HISTORY: Mutex<Option<HashMap<u32, (crate::config::FenceCfg, u64)>>> =
     Mutex::new(None);
 
-use windows::Win32::Foundation::{CloseHandle, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoTaskMemFree, IServiceProvider, CLSCTX_LOCAL_SERVER,
+};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Memory::{
     VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
 };
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+};
+use windows::Win32::System::Variant::{
+    VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4,
+};
 use windows::Win32::UI::Controls::{
     LVM_GETITEMCOUNT, LVM_GETITEMPOSITION, LVM_GETITEMSPACING, LVM_SETITEMPOSITION,
     LVS_AUTOARRANGE,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowLongPtrW, GetWindowThreadProcessId, SendMessageW, SetWindowLongPtrW,
-    GWL_STYLE,
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+use windows::Win32::UI::Shell::{
+    IFolderView, IShellBrowser, IShellFolder, IShellWindows, ShellWindows, CSIDL_DESKTOP,
+    SID_STopLevelBrowser, SVSI_POSITIONITEM, SWC_DESKTOP, SWFO_NEEDDISPATCH,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowThreadProcessId, SendMessageW,
+    SetWindowLongPtrW, WindowFromPoint, GWL_STYLE,
+};
+use windows::core::{Interface, PCWSTR};
 
 fn overlaps(a: RECT, b: RECT) -> bool {
     a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
@@ -214,6 +229,231 @@ pub fn reserve(reserved_screen: &[RECT]) {
 
 /// 记录栅栏移动/缩放前的配置快照(每个 id 只记一次)。由栅栏 WM_LBUTTONDOWN
 /// 进入拖动/缩放时调用——此时窗口还在原位。
+const DROP_ITEM_RETRIES: usize = 30;
+const DROP_ITEM_RETRY_DELAY_MS: u64 = 35;
+const DROP_ITEM_STABLE_SAMPLES: usize = 3;
+
+fn variant_i4(value: i32) -> VARIANT {
+    VARIANT {
+        Anonymous: VARIANT_0 {
+            Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                vt: VT_I4,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: VARIANT_0_0_0 { lVal: value },
+            }),
+        },
+    }
+}
+
+unsafe fn desktop_folder_view() -> windows::core::Result<IFolderView> {
+    let shell_windows: IShellWindows =
+        unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)? };
+    let location = variant_i4(CSIDL_DESKTOP as i32);
+    let root = VARIANT::default();
+    let mut desktop_hwnd = 0i32;
+    let dispatch = unsafe {
+        shell_windows.FindWindowSW(
+            &location,
+            &root,
+            SWC_DESKTOP,
+            &mut desktop_hwnd,
+            SWFO_NEEDDISPATCH,
+        )?
+    };
+    let services: IServiceProvider = dispatch.cast()?;
+    let browser: IShellBrowser = unsafe { services.QueryService(&SID_STopLevelBrowser)? };
+    let shell_view = unsafe { browser.QueryActiveShellView()? };
+    shell_view.cast()
+}
+
+struct OwnedPidl(*mut ITEMIDLIST);
+
+impl Drop for OwnedPidl {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(Some(self.0 as *const c_void)) };
+    }
+}
+
+unsafe fn desktop_child_pidl(view: &IFolderView, source_path: &Path) -> Option<(OwnedPidl, String)> {
+    let label = source_path.file_name()?.to_string_lossy().into_owned();
+    let mut label_w: Vec<u16> = label.encode_utf16().collect();
+    label_w.push(0);
+    let folder: IShellFolder = unsafe { view.GetFolder().ok()? };
+    let mut raw = std::ptr::null_mut();
+    let mut attributes = 0u32;
+    unsafe {
+        folder
+            .ParseDisplayName(
+                HWND::default(),
+                None,
+                PCWSTR(label_w.as_ptr()),
+                None,
+                &mut raw,
+                &mut attributes,
+            )
+            .ok()?;
+    }
+    (!raw.is_null()).then_some((OwnedPidl(raw), label))
+}
+
+fn centered_icon_position(cursor: POINT, client: RECT, cell_w: i32, cell_h: i32) -> POINT {
+    let max_x = (client.right - cell_w).max(client.left);
+    let max_y = (client.bottom - cell_h).max(client.top);
+    POINT {
+        x: (cursor.x - cell_w / 2).clamp(client.left, max_x),
+        y: (cursor.y - cell_h / 2).clamp(client.top, max_y),
+    }
+}
+
+unsafe fn point_hits_desktop_list(list: HWND, screen: POINT) -> bool {
+    let mut hit = unsafe { WindowFromPoint(screen) };
+    for _ in 0..10 {
+        if hit == list {
+            return true;
+        }
+        if hit.is_invalid() {
+            return false;
+        }
+        let Ok(parent) = (unsafe { GetParent(hit) }) else {
+            return false;
+        };
+        if parent.is_invalid() || parent == hit {
+            return false;
+        }
+        hit = parent;
+    }
+    false
+}
+
+/// True when the release point belongs to Explorer's desktop ListView rather than a fence or
+/// another Explorer window. This is also used to keep our desktop shortcut collector from
+/// immediately reclaiming a shortcut that the user just dragged out of a fence.
+pub fn is_desktop_drop_point(screen_point: POINT) -> bool {
+    let Some(list) = crate::utils::find_desktop_listview() else {
+        return false;
+    };
+    unsafe { point_hits_desktop_list(list, screen_point) }
+}
+
+/// If the OLE drop ended on Explorer's desktop, move the newly-created ListView item so its
+/// icon cell is centred on the actual mouse release point. Position through `IFolderView` so
+/// Explorer's own folder-view state and the visible ListView stay in sync.
+pub fn place_file_at_drop_point(source_path: &Path, screen_point: POINT) -> bool {
+    let Some(list) = crate::utils::find_desktop_listview() else {
+        return false;
+    };
+    unsafe {
+        if !is_desktop_drop_point(screen_point) {
+            return false;
+        }
+        let style = GetWindowLongPtrW(list, GWL_STYLE);
+        if style & LVS_AUTOARRANGE as isize != 0 {
+            crate::dlog("[desktop-drop] skipped positioning because desktop auto-arrange is on");
+            return false;
+        }
+
+        let mut client_point = screen_point;
+        if !ScreenToClient(list, &mut client_point).as_bool() {
+            return false;
+        }
+        let mut client = RECT::default();
+        if GetClientRect(list, &mut client).is_err() {
+            return false;
+        }
+        let packed = SendMessageW(
+            list,
+            LVM_GETITEMSPACING,
+            Some(WPARAM(0)),
+            Some(LPARAM(0)),
+        )
+        .0 as u32;
+        let cell_w = ((packed & 0xffff) as i32).max(48);
+        let cell_h = ((packed >> 16) as i32).max(48);
+        let desired = centered_icon_position(client_point, client, cell_w, cell_h);
+
+        let view = match desktop_folder_view() {
+            Ok(view) => view,
+            Err(error) => {
+                crate::dlog(&format!(
+                    "[desktop-drop] could not acquire Explorer folder view: {error:?}"
+                ));
+                return false;
+            }
+        };
+        let Some((pidl, label)) = desktop_child_pidl(&view, source_path) else {
+            crate::dlog(&format!(
+                "[desktop-drop] could not resolve desktop item for {}",
+                source_path.display()
+            ));
+            return false;
+        };
+
+        // Explorer can return from DoDragDrop before its folder-view transaction has fully
+        // published the new item. Wait for a few identical positions, then position through
+        // IFolderView so Explorer's model and the visible ListView are updated together.
+        let mut last_position: Option<POINT> = None;
+        let mut stable_samples = 0usize;
+        let mut appeared = false;
+        for attempt in 0..DROP_ITEM_RETRIES {
+            if let Ok(position) = view.GetItemPosition(pidl.0) {
+                appeared = true;
+                if last_position
+                    .map(|last| last.x == position.x && last.y == position.y)
+                    .unwrap_or(false)
+                {
+                    stable_samples += 1;
+                } else {
+                    stable_samples = 1;
+                    last_position = Some(position);
+                }
+                if stable_samples >= DROP_ITEM_STABLE_SAMPLES {
+                    break;
+                }
+            }
+            if attempt + 1 < DROP_ITEM_RETRIES {
+                std::thread::sleep(Duration::from_millis(DROP_ITEM_RETRY_DELAY_MS));
+            }
+        }
+        if !appeared {
+            crate::dlog(&format!(
+                "[desktop-drop] desktop item did not appear for {}",
+                source_path.display()
+            ));
+            return false;
+        }
+
+        let child = pidl.0 as *const ITEMIDLIST;
+        let positioned = view
+            .SelectAndPositionItems(
+                1,
+                &child,
+                Some(&desired),
+                SVSI_POSITIONITEM.0 as u32,
+            )
+            .is_ok();
+        let actual = if positioned {
+            view.GetItemPosition(pidl.0)
+                .unwrap_or(POINT { x: -1, y: -1 })
+        } else {
+            POINT { x: -1, y: -1 }
+        };
+        crate::dlog(&format!(
+            "[desktop-drop] item=\"{}\" method=folder-view release=({}, {}) requested=({}, {}) actual=({}, {}) positioned={}",
+            label,
+            screen_point.x,
+            screen_point.y,
+            desired.x,
+            desired.y,
+            actual.x,
+            actual.y,
+            positioned
+        ));
+        positioned
+    }
+}
+
 pub fn record_fence(cfg: &crate::config::FenceCfg) {
     let now = now_unix();
     let mut guard = FENCE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -285,5 +525,24 @@ pub fn restore_autoarrange() {
         {
             let _ = SetWindowLongPtrW(list, GWL_STYLE, style | (LVS_AUTOARRANGE as isize));
         }
+    }
+}
+
+#[cfg(test)]
+mod drop_position_tests {
+    use super::centered_icon_position;
+    use windows::Win32::Foundation::{POINT, RECT};
+
+    #[test]
+    fn release_point_centres_and_clamps_the_icon_cell() {
+        let client = RECT { left: 0, top: 0, right: 1000, bottom: 800 };
+        assert_eq!(
+            centered_icon_position(POINT { x: 500, y: 400 }, client, 100, 80),
+            POINT { x: 450, y: 360 }
+        );
+        assert_eq!(
+            centered_icon_position(POINT { x: 5, y: 5 }, client, 100, 80),
+            POINT { x: 0, y: 0 }
+        );
     }
 }
