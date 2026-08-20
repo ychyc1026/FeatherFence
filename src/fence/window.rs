@@ -22,8 +22,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetCursorPos, GetSystemMetrics, GetWindowRect, LoadCursorW,
     PostMessageW, RegisterClassW, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow,
     CS_DBLCLKS, HTCLIENT, IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
-    IDC_SIZEALL, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SC_MINIMIZE, SIZE_MINIMIZED, WNDCLASSW,
+    IDC_SIZEALL, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SC_MINIMIZE, SIZE_MINIMIZED,
+    SW_HIDE, WNDCLASSW,
     WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
@@ -85,11 +86,16 @@ pub fn register_class() {
 pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
     unsafe {
         let title_w = wstr(&cfg.title);
+        let ex_style = if crate::perf::targetable_window() {
+            WS_EX_LAYERED
+        } else {
+            WS_EX_TOOLWINDOW | WS_EX_LAYERED
+        };
         let r = CreateWindowExW(
             // 分层窗口 + ULW 整幅提交:逐像素 alpha,半透明面板真透明透出桌面。
             // 圆角由 DWM 裁(DWMWCP_ROUND 对分层窗口同样生效)。
             // 启动时用 SW_SHOWNA 避免抢焦点；用户点击后允许激活，才能接收 Delete。
-            WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            ex_style,
             w!("FeatherFence"),
             PCWSTR(title_w.as_ptr()),
             WS_POPUP,
@@ -429,7 +435,7 @@ unsafe extern "system" fn fence_wndproc(
             }
             // 达到拖拽阈值后要启动的拖出(路径 + 目标目录),在 with_global 之外执行。
             // 复制/移动由 OLE 目标根据拖动过程中的实时按键决定。
-            let mut drag_path: Option<(String, PathBuf, crate::perf::DropTrace)> = None;
+            let mut drag_path: Option<(String, PathBuf, HWND, crate::perf::DropTrace)> = None;
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
                     let ghost = g.config.ghost_mode;
@@ -536,6 +542,7 @@ unsafe extern "system" fn fence_wndproc(
                                         drag_path = Some((
                                             p.to_string_lossy().to_string(),
                                             vault,
+                                            g.msg_hwnd,
                                             crate::perf::DropTrace::start(),
                                         ));
                                     }
@@ -558,7 +565,7 @@ unsafe extern "system" fn fence_wndproc(
                 }
             });
             // 在锁外启动 OLE 拖出(阻塞到松手);拖出后文件可能被移动/删除 → 重扫目录刷新
-            if let Some((path, vault, trace)) = drag_path {
+            if let Some((path, vault, msg_hwnd, trace)) = drag_path {
                 let threshold_elapsed = trace.elapsed();
                 trace.announce("out", 1);
                 if let Some(elapsed) = threshold_elapsed {
@@ -567,11 +574,35 @@ unsafe extern "system" fn fence_wndproc(
                     });
                 }
                 let shortcut_begin_started = trace.stage_start();
+                crate::desktop_icons::cancel_pending_drop_position(
+                    msg_hwnd,
+                    "desktop_position_new_drag",
+                );
                 crate::begin_shortcut_dragout();
                 trace.finish_stage("shortcut_begin", shortcut_begin_started, String::new);
 
+                // The safe UI driver only drags inside the selected window's bounds. In explicit
+                // profiling mode, temporarily hide the source after the threshold so Explorer
+                // underneath receives the real desktop OLE drop even if the driver resolves the
+                // destination against the window again while the drag is in flight.
+                let test_source_hidden = if crate::perf::targetable_window() {
+                    let hidden = ShowWindow(hwnd, SW_HIDE).as_bool();
+                    trace.event("test_source_hidden", || format!("was_visible={hidden}"));
+                    hidden
+                } else {
+                    false
+                };
+
+                let name_check_started = trace.stage_start();
+                let desktop_name_state = crate::desktop_icons::snapshot_desktop_name(
+                    std::path::Path::new(&path),
+                );
+                trace.finish_stage("desktop_name_snapshot", name_check_started, || {
+                    format!("scope=exclusive state={desktop_name_state:?}")
+                });
                 let ole_started = trace.stage_start();
-                let effect = crate::dragout::start_drag(vec![path.clone()], trace);
+                let drag_result = crate::dragout::start_drag(vec![path.clone()], trace);
+                let effect = drag_result.effect;
                 trace.finish_stage("ole_modal", ole_started, || {
                     format!(
                         "scope=aggregate includes_pointer_hold=true effect_bits={}",
@@ -581,15 +612,21 @@ unsafe extern "system" fn fence_wndproc(
                 let post_ole_started = trace.stage_start();
 
                 let desktop_check_started = trace.stage_start();
-                let mut release_point = POINT::default();
-                let have_release_point = GetCursorPos(&mut release_point).is_ok();
+                let captured_release = drag_result.release;
+                let mut release_point = captured_release
+                    .and_then(|release| release.screen_point)
+                    .unwrap_or_default();
+                let have_release_point = captured_release
+                    .and_then(|release| release.screen_point)
+                    .is_some()
+                    || GetCursorPos(&mut release_point).is_ok();
                 let dropped_on_desktop = effect.0 != 0
                     && have_release_point
                     && crate::desktop_icons::is_desktop_drop_point(release_point);
                 trace.finish_stage("desktop_check", desktop_check_started, || {
                     format!(
-                        "effect_bits={} have_point={have_release_point} desktop={dropped_on_desktop}",
-                        effect.0
+                        "effect_bits={} have_point={have_release_point} desktop={dropped_on_desktop} release_x={} release_y={}",
+                        effect.0, release_point.x, release_point.y
                     )
                 });
 
@@ -599,15 +636,42 @@ unsafe extern "system" fn fence_wndproc(
                     format!("desktop={dropped_on_desktop}")
                 });
 
-                let positioned = if dropped_on_desktop {
-                    crate::desktop_icons::place_file_at_drop_point(
+                let position_queued = if dropped_on_desktop
+                    && !drag_result.newer_left_press
+                    && captured_release
+                        .and_then(|release| release.screen_point.map(|point| (release.at, point)))
+                        .is_some()
+                {
+                    let (released_at, captured_point) = captured_release
+                        .and_then(|release| release.screen_point.map(|point| (release.at, point)))
+                        .expect("captured release checked");
+                    crate::desktop_icons::queue_file_at_drop_point(
+                        msg_hwnd,
                         std::path::Path::new(&path),
-                        release_point,
+                        desktop_name_state,
+                        captured_point,
+                        released_at,
                         trace,
-                    )
+                    ) == crate::desktop_icons::QueueDropPosition::Queued
                 } else {
+                    if dropped_on_desktop {
+                        trace.event("desktop_position_rejected", || {
+                            format!(
+                                "reason={} captured_release={}",
+                                if drag_result.newer_left_press {
+                                    "newer_pointer_interaction"
+                                } else {
+                                    "release_not_captured"
+                                },
+                                captured_release.is_some()
+                            )
+                        });
+                    }
                     false
                 };
+                if test_source_hidden {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
 
                 let mut fence_id = None;
                 let mut scan_elapsed = None;
@@ -647,25 +711,27 @@ unsafe extern "system" fn fence_wndproc(
 
                 trace.finish_stage("post_ole", post_ole_started, || {
                     format!(
-                        "scope=aggregate effect_bits={} desktop={dropped_on_desktop} positioned={positioned}",
+                        "scope=aggregate effect_bits={} desktop={dropped_on_desktop} position_queued={position_queued}",
                         effect.0
                     )
                 });
                 let outcome = if effect.0 == 0 {
                     "cancelled"
-                } else if dropped_on_desktop && positioned {
-                    "desktop_positioned"
+                } else if dropped_on_desktop && position_queued {
+                    "desktop_position_pending"
                 } else if dropped_on_desktop {
                     "desktop_unpositioned"
                 } else {
                     "dropped_elsewhere"
                 };
-                trace.finish(outcome, || {
-                    format!(
-                        "effect_bits={} desktop={dropped_on_desktop} positioned={positioned}",
-                        effect.0
-                    )
-                });
+                if !position_queued {
+                    trace.finish(outcome, || {
+                        format!(
+                            "effect_bits={} desktop={dropped_on_desktop} position_queued={position_queued}",
+                            effect.0
+                        )
+                    });
+                }
             }
             return LRESULT(0);
         }

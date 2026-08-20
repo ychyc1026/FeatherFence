@@ -311,6 +311,22 @@ pub(crate) fn desktop_layer_tick(g: &mut Global) {
     if g.zen {
         return;
     }
+    if perf::targetable_window() {
+        // Show Desktop may minimize the profiling-only normal window. Restore it for the safe UI
+        // driver, but leave its Z order alone so the desktop remains the drop target underneath.
+        for f in g
+            .fences
+            .iter()
+            .filter(|f| f.valid && download_box_should_show(g, f.cfg.id))
+        {
+            unsafe {
+                if IsIconic(f.hwnd).as_bool() {
+                    let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
+                }
+            }
+        }
+        return;
+    }
     let host_valid = g.desktop_host.is_some_and(|h| unsafe { IsWindow(Some(h)).as_bool() });
     if !host_valid {
         g.desktop_host = utils::find_desktop_host();

@@ -354,6 +354,7 @@ unsafe extern "system" fn msg_wndproc(
         return LRESULT(0);
     }
     if msg == WM_DESTROY {
+        desktop_icons::shutdown_drop_positioner(hwnd);
         PostQuitMessage(0);
         return LRESULT(0);
     }
@@ -885,6 +886,8 @@ fn main() {
             DispatchMessageW(&msg);
         }
     }
+
+    desktop_icons::shutdown_drop_positioner(msg_hwnd);
 
     // 清理
     with_global(|g| {

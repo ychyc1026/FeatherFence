@@ -25,7 +25,9 @@ use windows::Win32::System::Ole::{
     DROPEFFECT_MOVE, DROPEFFECT_NONE, ReleaseStgMedium,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::Shell::{CFSTR_PERFORMEDDROPEFFECT, DROPFILES};
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 /// DATA_E_FORMATETC:请求的格式不是 CF_HDROP
 const DATA_E_FORMATETC: HRESULT = HRESULT(0x80040064_u32 as _);
@@ -40,8 +42,23 @@ fn final_drop_effect(ole_effect: DROPEFFECT, shell_reported: u32) -> DROPEFFECT 
     DROPEFFECT(bits & allowed)
 }
 
+#[derive(Clone, Copy)]
+pub struct DragRelease {
+    pub screen_point: Option<POINT>,
+    pub at: Instant,
+}
+
+#[derive(Clone, Copy)]
+pub struct DragResult {
+    pub effect: DROPEFFECT,
+    pub release: Option<DragRelease>,
+    /// A second left press occurred after the original drag began. If it follows `release`, a
+    /// delayed desktop-position write must not overwrite that newer user interaction.
+    pub newer_left_press: bool,
+}
+
 /// 拖出指定路径:阻塞到拖拽结束。返回实际拖放效果(MOVE/COPY/NONE)。
-pub fn start_drag(paths: Vec<String>, trace: crate::perf::DropTrace) -> DROPEFFECT {
+pub fn start_drag(paths: Vec<String>, trace: crate::perf::DropTrace) -> DragResult {
     crate::dlog(&format!("[dragout] start drag: {}", paths.join("; ")));
     unsafe {
         let performed_effect = Arc::new(AtomicU32::new(DROPEFFECT_NONE.0));
@@ -50,12 +67,15 @@ pub fn start_drag(paths: Vec<String>, trace: crate::perf::DropTrace) -> DROPEFFE
             performed_effect: Arc::clone(&performed_effect),
         }
         .into();
-        let released_at = (trace.id() != 0).then(|| Arc::new(OnceLock::new()));
+        let release = Arc::new(OnceLock::new());
         let src: IDropSource = FileDropSource {
-            released_at: released_at.clone(),
+            release: Arc::clone(&release),
         }
         .into();
         let mut effect = DROPEFFECT_NONE;
+        // Clear the original press transition. A later low bit then means the user pressed
+        // again while Explorer was still completing this operation.
+        let _ = GetAsyncKeyState(VK_LBUTTON.0 as i32);
         let hr = DoDragDrop(
             &dataobj,
             &src,
@@ -72,11 +92,9 @@ pub fn start_drag(paths: Vec<String>, trace: crate::perf::DropTrace) -> DROPEFFE
         } else {
             "none"
         };
-        if let Some(released_at) = released_at
-            .as_ref()
-            .and_then(|released_at| released_at.get())
-        {
-            trace.record_stage("release_to_ole_return", released_at.elapsed(), || {
+        let release = release.get().copied();
+        if let Some(release) = release {
+            trace.record_stage("release_to_ole_return", release.at.elapsed(), || {
                 format!(
                     "scope=exclusive hr=0x{:08x} ole_effect={} shell_effect={} final={name}",
                     hr.0 as u32, effect.0, shell_reported
@@ -90,7 +108,12 @@ pub fn start_drag(paths: Vec<String>, trace: crate::perf::DropTrace) -> DROPEFFE
             shell_reported,
             name
         ));
-        final_effect
+        let pointer_state = GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16;
+        DragResult {
+            effect: final_effect,
+            release,
+            newer_left_press: pointer_state & 0x8001 != 0,
+        }
     }
 }
 
@@ -410,7 +433,7 @@ mod tests {
 /// 拖拽过程控制:Esc 取消;松开左键 → 落下;GiveFeedback 用 OLE 默认光标。
 #[implement(IDropSource)]
 pub struct FileDropSource {
-    released_at: Option<Arc<OnceLock<Instant>>>,
+    release: Arc<OnceLock<DragRelease>>,
 }
 
 impl IDropSource_Impl for FileDropSource_Impl {
@@ -418,9 +441,13 @@ impl IDropSource_Impl for FileDropSource_Impl {
         if fescapepressed.as_bool() {
             DRAGDROP_S_CANCEL
         } else if !grfkeystate.contains(MK_LBUTTON) {
-            if let Some(released_at) = &self.released_at {
-                let _ = released_at.set(Instant::now());
-            }
+            let at = Instant::now();
+            let mut point = POINT::default();
+            let screen_point = unsafe { GetCursorPos(&mut point) }.is_ok().then_some(point);
+            let _ = self.release.set(DragRelease {
+                screen_point,
+                at,
+            });
             DRAGDROP_S_DROP
         } else {
             S_OK

@@ -2,10 +2,12 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{size_of, ManuallyDrop};
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 撤销窗口：图标/栅栏被搬移后 1 分钟内可「撤销并关闭避让」,超时记录作废,
 /// 防止长期开启避让时 static 历史无限累积。
@@ -23,7 +25,8 @@ static FENCE_HISTORY: Mutex<Option<HashMap<u32, (crate::config::FenceCfg, u64)>>
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoTaskMemFree, IServiceProvider, CLSCTX_LOCAL_SERVER,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IServiceProvider,
+    CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
 };
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Memory::{
@@ -39,14 +42,17 @@ use windows::Win32::UI::Controls::{
     LVM_GETITEMCOUNT, LVM_GETITEMPOSITION, LVM_GETITEMSPACING, LVM_SETITEMPOSITION,
     LVS_AUTOARRANGE,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     IFolderView, IShellBrowser, IShellFolder, IShellWindows, ShellWindows, CSIDL_DESKTOP,
     SID_STopLevelBrowser, SVSI_POSITIONITEM, SWC_DESKTOP, SWFO_NEEDDISPATCH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetParent, GetWindowLongPtrW, GetWindowThreadProcessId, SendMessageW,
-    SetWindowLongPtrW, WindowFromPoint, GWL_STYLE,
+    DispatchMessageW, GetClientRect, GetParent, GetWindowLongPtrW, GetWindowThreadProcessId,
+    MsgWaitForMultipleObjectsEx, PeekMessageW, SendMessageTimeoutW, SendMessageW,
+    SetWindowLongPtrW, TranslateMessage, WindowFromPoint, GWL_STYLE, MSG, MWMO_INPUTAVAILABLE,
+    PM_NOREMOVE, PM_REMOVE, QS_ALLINPUT, SMTO_ABORTIFHUNG, SMTO_BLOCK,
 };
 use windows::core::{Interface, PCWSTR};
 
@@ -227,11 +233,60 @@ pub fn reserve(reserved_screen: &[RECT]) {
     }
 }
 
-/// 记录栅栏移动/缩放前的配置快照(每个 id 只记一次)。由栅栏 WM_LBUTTONDOWN
-/// 进入拖动/缩放时调用——此时窗口还在原位。
-const DROP_ITEM_RETRIES: usize = 30;
-const DROP_ITEM_RETRY_DELAY_MS: u64 = 35;
-const DROP_ITEM_STABLE_SAMPLES: usize = 3;
+const DROP_POSITION_RETRY_MS: u32 = 30;
+const DROP_POSITION_SETTLE_DELAY: Duration = Duration::from_millis(330);
+const DROP_POSITION_TIMEOUT: Duration = Duration::from_millis(2000);
+const POINTER_WATCH_POLL: Duration = Duration::from_millis(8);
+const MAX_DROP_POSITION_WORKERS: u32 = 2;
+static DROP_GENERATION: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_DROP_POSITION_WORKERS: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QueueDropPosition {
+    Queued,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PositionAttemptGate {
+    Continue,
+    Expired,
+    Cancelled,
+}
+
+fn position_attempt_gate(release_age: Duration, new_input: bool) -> PositionAttemptGate {
+    if release_age >= DROP_POSITION_TIMEOUT {
+        PositionAttemptGate::Expired
+    } else if new_input {
+        PositionAttemptGate::Cancelled
+    } else {
+        PositionAttemptGate::Continue
+    }
+}
+
+fn pointer_state_has_press(state: u16) -> bool {
+    state & 0x8001 != 0
+}
+
+struct DesktopDropJob {
+    generation: u64,
+    label: String,
+    label_w: Vec<u16>,
+    screen_point: POINT,
+    list_value: usize,
+    desired: POINT,
+    desired_ready: bool,
+    started: Instant,
+    released_at: Instant,
+    not_before: Instant,
+    attempts: u32,
+    view_attempts: u32,
+    resolve_attempts: u32,
+    probe_attempts: u32,
+    appeared: bool,
+    trace: crate::perf::DropTrace,
+    total_started: Option<Instant>,
+}
 
 fn variant_i4(value: i32) -> VARIANT {
     VARIANT {
@@ -276,10 +331,7 @@ impl Drop for OwnedPidl {
     }
 }
 
-unsafe fn desktop_child_pidl(view: &IFolderView, source_path: &Path) -> Option<(OwnedPidl, String)> {
-    let label = source_path.file_name()?.to_string_lossy().into_owned();
-    let mut label_w: Vec<u16> = label.encode_utf16().collect();
-    label_w.push(0);
+unsafe fn desktop_child_pidl(view: &IFolderView, label_w: &[u16]) -> Option<OwnedPidl> {
     let folder: IShellFolder = unsafe { view.GetFolder().ok()? };
     let mut raw = std::ptr::null_mut();
     let mut attributes = 0u32;
@@ -295,7 +347,7 @@ unsafe fn desktop_child_pidl(view: &IFolderView, source_path: &Path) -> Option<(
             )
             .ok()?;
     }
-    (!raw.is_null()).then_some((OwnedPidl(raw), label))
+    (!raw.is_null()).then_some(OwnedPidl(raw))
 }
 
 fn centered_icon_position(cursor: POINT, client: RECT, cell_w: i32, cell_h: i32) -> POINT {
@@ -337,183 +389,667 @@ pub fn is_desktop_drop_point(screen_point: POINT) -> bool {
     unsafe { point_hits_desktop_list(list, screen_point) }
 }
 
-/// If the OLE drop ended on Explorer's desktop, move the newly-created ListView item so its
-/// icon cell is centred on the actual mouse release point. Position through `IFolderView` so
-/// Explorer's own folder-view state and the visible ListView stay in sync.
-pub fn place_file_at_drop_point(
-    source_path: &Path,
-    screen_point: POINT,
-    trace: crate::perf::DropTrace,
-) -> bool {
-    let total_started = trace.stage_start();
-    let mut outcome = "desktop_list_missing";
-    let mut attempts = 0usize;
-    let mut sleep_count = 0usize;
-    let mut stable_samples = 0usize;
-    let mut appeared = false;
+unsafe fn desired_drop_position(list: HWND, screen_point: POINT) -> Result<POINT, &'static str> {
+    let style = unsafe { GetWindowLongPtrW(list, GWL_STYLE) };
+    if style & LVS_AUTOARRANGE as isize != 0 {
+        return Err("auto_arrange");
+    }
 
-    let positioned = (|| {
-        let Some(list) = crate::utils::find_desktop_listview() else {
-            return false;
-        };
-        unsafe {
-        if !is_desktop_drop_point(screen_point) {
-            outcome = "release_not_on_desktop";
-            return false;
-        }
-        let style = GetWindowLongPtrW(list, GWL_STYLE);
-        if style & LVS_AUTOARRANGE as isize != 0 {
-            crate::dlog("[desktop-drop] skipped positioning because desktop auto-arrange is on");
-            outcome = "auto_arrange";
-            return false;
-        }
-
-        let mut client_point = screen_point;
-        if !ScreenToClient(list, &mut client_point).as_bool() {
-            outcome = "screen_to_client_failed";
-            return false;
-        }
-        let mut client = RECT::default();
-        if GetClientRect(list, &mut client).is_err() {
-            outcome = "client_rect_failed";
-            return false;
-        }
-        let packed = SendMessageW(
+    let mut client_point = screen_point;
+    if !unsafe { ScreenToClient(list, &mut client_point) }.as_bool() {
+        return Err("screen_to_client_failed");
+    }
+    let mut client = RECT::default();
+    if unsafe { GetClientRect(list, &mut client) }.is_err() {
+        return Err("client_rect_failed");
+    }
+    let mut packed = 0usize;
+    if unsafe {
+        SendMessageTimeoutW(
             list,
             LVM_GETITEMSPACING,
-            Some(WPARAM(0)),
-            Some(LPARAM(0)),
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            50,
+            Some(&mut packed),
         )
-        .0 as u32;
-        let cell_w = ((packed & 0xffff) as i32).max(48);
-        let cell_h = ((packed >> 16) as i32).max(48);
-        let desired = centered_icon_position(client_point, client, cell_w, cell_h);
-
-        let view_started = trace.stage_start();
-        let view_result = desktop_folder_view();
-        trace.finish_stage("desktop_view", view_started, || {
-            format!("scope=exclusive ok={}", view_result.is_ok())
-        });
-        let view = match view_result {
-            Ok(view) => view,
-            Err(error) => {
-                crate::dlog(&format!(
-                    "[desktop-drop] could not acquire Explorer folder view: {error:?}"
-                ));
-                outcome = "folder_view_failed";
-                return false;
-            }
-        };
-
-        let resolve_started = trace.stage_start();
-        let resolved = desktop_child_pidl(&view, source_path);
-        trace.finish_stage("desktop_resolve_item", resolve_started, || {
-            format!("scope=exclusive ok={}", resolved.is_some())
-        });
-        let Some((pidl, label)) = resolved else {
-            crate::dlog(&format!(
-                "[desktop-drop] could not resolve desktop item for {}",
-                source_path.display()
-            ));
-            outcome = "resolve_item_failed";
-            return false;
-        };
-
-        // Explorer can return from DoDragDrop before its folder-view transaction has fully
-        // published the new item. Wait for a few identical positions, then position through
-        // IFolderView so Explorer's model and the visible ListView are updated together.
-        let mut last_position: Option<POINT> = None;
-        let wait_started = trace.stage_start();
-        for attempt in 0..DROP_ITEM_RETRIES {
-            attempts = attempt + 1;
-            if let Ok(position) = view.GetItemPosition(pidl.0) {
-                appeared = true;
-                if last_position
-                    .map(|last| last.x == position.x && last.y == position.y)
-                    .unwrap_or(false)
-                {
-                    stable_samples += 1;
-                } else {
-                    stable_samples = 1;
-                    last_position = Some(position);
-                }
-                if stable_samples >= DROP_ITEM_STABLE_SAMPLES {
-                    break;
-                }
-            }
-            if attempt + 1 < DROP_ITEM_RETRIES {
-                sleep_count += 1;
-                std::thread::sleep(Duration::from_millis(DROP_ITEM_RETRY_DELAY_MS));
-            }
-        }
-        let wait_elapsed = wait_started
-            .map(|started| started.elapsed())
-            .unwrap_or_default();
-        trace.finish_stage("desktop_wait", wait_started, || {
-            format!(
-                "scope=exclusive attempts={attempts} sleeps={sleep_count} stable_samples={stable_samples} appeared={appeared} wait_wall_us={}",
-                wait_elapsed.as_micros()
-            )
-        });
-        if !appeared {
-            crate::dlog(&format!(
-                "[desktop-drop] desktop item did not appear for {}",
-                source_path.display()
-            ));
-            outcome = "item_not_appeared";
-            return false;
-        }
-
-        let child = pidl.0 as *const ITEMIDLIST;
-        let position_started = trace.stage_start();
-        let did_position = view
-            .SelectAndPositionItems(
-                1,
-                &child,
-                Some(&desired),
-                SVSI_POSITIONITEM.0 as u32,
-            )
-            .is_ok();
-        let actual = if did_position {
-            view.GetItemPosition(pidl.0)
-                .unwrap_or(POINT { x: -1, y: -1 })
-        } else {
-            POINT { x: -1, y: -1 }
-        };
-        trace.finish_stage("desktop_position", position_started, || {
-            format!(
-                "scope=exclusive ok={did_position} requested_x={} requested_y={} actual_x={} actual_y={}",
-                desired.x, desired.y, actual.x, actual.y
-            )
-        });
-        crate::dlog(&format!(
-            "[desktop-drop] item=\"{}\" method=folder-view release=({}, {}) requested=({}, {}) actual=({}, {}) positioned={}",
-            label,
-            screen_point.x,
-            screen_point.y,
-            desired.x,
-            desired.y,
-            actual.x,
-            actual.y,
-            did_position
-        ));
-        outcome = if did_position {
-            "positioned"
-        } else {
-            "position_failed"
-        };
-        did_position
-        }
-    })();
-
-    trace.finish_stage("desktop_position_total", total_started, || {
-        format!(
-            "scope=aggregate ok={positioned} outcome={outcome} attempts={attempts} sleeps={sleep_count} stable_samples={stable_samples} appeared={appeared}"
-        )
-    });
-    positioned
+    }
+    .0 == 0
+    {
+        return Err("item_spacing_timeout");
+    }
+    let packed = packed as u32;
+    let cell_w = ((packed & 0xffff) as i32).max(48);
+    let cell_h = ((packed >> 16) as i32).max(48);
+    Ok(centered_icon_position(
+        client_point,
+        client,
+        cell_w,
+        cell_h,
+    ))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DesktopNameState {
+    Absent,
+    Present,
+    Unknown,
+}
+
+/// Snapshot the ambiguous leaf name immediately before entering OLE. A pre-existing item in
+/// either physical desktop folder makes Explorer's merged-view PIDL ambiguous, so positioning is
+/// skipped. Errors fail closed. `symlink_metadata` also counts broken reparse points as present.
+pub(crate) fn snapshot_desktop_name(source_path: &Path) -> DesktopNameState {
+    let Some(name) = source_path.file_name() else {
+        return DesktopNameState::Unknown;
+    };
+    let (Some(desktop), Some(public_desktop)) =
+        (crate::desktop_dir(), crate::public_desktop_dir())
+    else {
+        return DesktopNameState::Unknown;
+    };
+    let mut roots = vec![desktop];
+    if public_desktop != roots[0] {
+        roots.push(public_desktop);
+    }
+    let mut unknown = false;
+    for root in roots {
+        match std::fs::symlink_metadata(root.join(name)) {
+            Ok(_) => return DesktopNameState::Present,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => unknown = true,
+        }
+    }
+    if unknown {
+        DesktopNameState::Unknown
+    } else {
+        DesktopNameState::Absent
+    }
+}
+
+fn next_drop_generation() -> u64 {
+    let next = DROP_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    if next == 0 {
+        DROP_GENERATION.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+    } else {
+        next
+    }
+}
+
+fn current_drop_generation() -> u64 {
+    DROP_GENERATION.load(Ordering::Acquire)
+}
+
+fn finish_drop_job(job: DesktopDropJob, outcome: &'static str, positioned: bool) {
+    job.trace
+        .finish_stage("desktop_position_total", job.total_started, || {
+            format!(
+                "scope=aggregate ok={positioned} outcome={outcome} attempts={} view_attempts={} resolve_attempts={} probe_attempts={} appeared={} wall_us={}",
+                job.attempts,
+                job.view_attempts,
+                job.resolve_attempts,
+                job.probe_attempts,
+                job.appeared,
+                job.started.elapsed().as_micros(),
+            )
+        });
+    job.trace.finish(outcome, || {
+        format!(
+            "desktop=true positioned={positioned} item=\"{}\" release_x={} release_y={} requested_ready={} requested_x={} requested_y={} release_age_us={}",
+            job.label,
+            job.screen_point.x,
+            job.screen_point.y,
+            job.desired_ready,
+            job.desired.x,
+            job.desired.y,
+            job.released_at.elapsed().as_micros(),
+        )
+    });
+}
+
+#[derive(Clone, Copy)]
+struct WorkerOutcome {
+    outcome: &'static str,
+    positioned: bool,
+}
+
+fn worker_gate(job: &DesktopDropJob, new_pointer_press: &AtomicBool) -> Option<WorkerOutcome> {
+    if current_drop_generation() != job.generation {
+        return Some(WorkerOutcome {
+            outcome: "desktop_position_superseded",
+            positioned: false,
+        });
+    }
+    match position_attempt_gate(
+        job.released_at.elapsed(),
+        new_pointer_press.load(Ordering::Acquire),
+    ) {
+        PositionAttemptGate::Expired => Some(WorkerOutcome {
+                outcome: "desktop_position_expired",
+                positioned: false,
+        }),
+        PositionAttemptGate::Cancelled => Some(WorkerOutcome {
+                outcome: "desktop_position_cancelled_by_input",
+                positioned: false,
+        }),
+        PositionAttemptGate::Continue => None,
+    }
+}
+
+fn prepare_sta_message_queue() {
+    let mut message = MSG::default();
+    unsafe {
+        let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+    }
+}
+
+fn wait_with_sta_message_pump(duration: Duration) {
+    let deadline = Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let timeout_ms = remaining.as_millis().clamp(1, u32::MAX as u128) as u32;
+        unsafe {
+            let _ = MsgWaitForMultipleObjectsEx(
+                None,
+                timeout_ms,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            );
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+}
+
+fn worker_pause(
+    job: &DesktopDropJob,
+    new_pointer_press: &AtomicBool,
+    duration: Duration,
+) -> Option<WorkerOutcome> {
+    let remaining = DROP_POSITION_TIMEOUT.saturating_sub(job.released_at.elapsed());
+    if !remaining.is_zero() {
+        wait_with_sta_message_pump(duration.min(remaining));
+    }
+    worker_gate(job, new_pointer_press)
+}
+
+unsafe fn position_on_worker(
+    job: &mut DesktopDropJob,
+    new_pointer_press: &AtomicBool,
+) -> WorkerOutcome {
+    while Instant::now() < job.not_before {
+        if let Some(outcome) = worker_gate(job, new_pointer_press) {
+            return outcome;
+        }
+        let remaining = job.not_before.saturating_duration_since(Instant::now());
+        if let Some(outcome) = worker_pause(
+            job,
+            new_pointer_press,
+            Duration::from_millis(DROP_POSITION_RETRY_MS as u64).min(remaining),
+        ) {
+            return outcome;
+        }
+    }
+
+    let mut list = HWND(job.list_value as *mut c_void);
+    let mut view: Option<IFolderView> = None;
+    let mut pidl: Option<OwnedPidl> = None;
+    let mut consecutive_resolve_failures = 0u8;
+    let mut consecutive_probe_failures = 0u8;
+
+    loop {
+        if let Some(outcome) = worker_gate(job, new_pointer_press) {
+            return outcome;
+        }
+        job.attempts += 1;
+
+        let Some(current_list) = crate::utils::find_desktop_listview() else {
+            pidl.take();
+            view.take();
+            if let Some(outcome) = worker_pause(
+                job,
+                new_pointer_press,
+                Duration::from_millis(DROP_POSITION_RETRY_MS as u64),
+            ) {
+                return outcome;
+            }
+            continue;
+        };
+        if current_list != list {
+            pidl.take();
+            view.take();
+            consecutive_resolve_failures = 0;
+            consecutive_probe_failures = 0;
+            list = current_list;
+            job.list_value = current_list.0 as usize;
+        }
+        if unsafe { GetWindowLongPtrW(current_list, GWL_STYLE) } & LVS_AUTOARRANGE as isize != 0 {
+            return WorkerOutcome {
+                outcome: "desktop_position_auto_arrange",
+                positioned: false,
+            };
+        }
+
+        if view.is_none() {
+            job.view_attempts += 1;
+            let started = job.trace.stage_start();
+            let result = unsafe { desktop_folder_view() };
+            job.trace.finish_stage("desktop_view", started, || {
+                format!(
+                    "scope=worker attempt={} ok={}",
+                    job.view_attempts,
+                    result.is_ok()
+                )
+            });
+            match result {
+                Ok(folder_view) => view = Some(folder_view),
+                Err(_) => {
+                    if let Some(outcome) = worker_pause(
+                        job,
+                        new_pointer_press,
+                        Duration::from_millis(DROP_POSITION_RETRY_MS as u64),
+                    ) {
+                        return outcome;
+                    }
+                    continue;
+                }
+            }
+            if let Some(outcome) = worker_gate(job, new_pointer_press) {
+                return outcome;
+            }
+        }
+
+        if pidl.is_none() {
+            job.resolve_attempts += 1;
+            let started = job.trace.stage_start();
+            let resolved = unsafe {
+                desktop_child_pidl(view.as_ref().expect("view acquired"), &job.label_w)
+            };
+            job.trace
+                .finish_stage("desktop_resolve_item", started, || {
+                    format!(
+                        "scope=worker attempt={} ok={}",
+                        job.resolve_attempts,
+                        resolved.is_some()
+                    )
+                });
+            if let Some(outcome) = worker_gate(job, new_pointer_press) {
+                return outcome;
+            }
+            match resolved {
+                Some(child) => {
+                    consecutive_resolve_failures = 0;
+                    pidl = Some(child);
+                }
+                None => {
+                    consecutive_resolve_failures = consecutive_resolve_failures.saturating_add(1);
+                    if consecutive_resolve_failures >= 3 {
+                        view.take();
+                        consecutive_resolve_failures = 0;
+                    }
+                    if let Some(outcome) = worker_pause(
+                        job,
+                        new_pointer_press,
+                        Duration::from_millis(DROP_POSITION_RETRY_MS as u64),
+                    ) {
+                        return outcome;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        job.probe_attempts += 1;
+        let probe_started = job.trace.stage_start();
+        let position = unsafe {
+            view
+                .as_ref()
+                .expect("view acquired")
+                .GetItemPosition(pidl.as_ref().expect("pidl resolved").0)
+        };
+        job.trace
+            .finish_stage("desktop_position_probe", probe_started, || {
+                format!(
+                    "scope=worker attempt={} ok={}",
+                    job.probe_attempts,
+                    position.is_ok()
+                )
+            });
+        if let Some(outcome) = worker_gate(job, new_pointer_press) {
+            return outcome;
+        }
+        let position = match position {
+            Ok(position) => {
+                job.appeared = true;
+                consecutive_probe_failures = 0;
+                position
+            }
+            Err(_) => {
+                consecutive_probe_failures = consecutive_probe_failures.saturating_add(1);
+                if consecutive_probe_failures >= 3 {
+                    pidl.take();
+                    view.take();
+                    consecutive_probe_failures = 0;
+                    consecutive_resolve_failures = 0;
+                }
+                if let Some(outcome) = worker_pause(
+                    job,
+                    new_pointer_press,
+                    Duration::from_millis(DROP_POSITION_RETRY_MS as u64),
+                ) {
+                    return outcome;
+                }
+                continue;
+            }
+        };
+
+        let Some(final_list) = crate::utils::find_desktop_listview() else {
+            return WorkerOutcome {
+                outcome: "desktop_position_view_lost_before_write",
+                positioned: false,
+            };
+        };
+        if final_list != list {
+            pidl.take();
+            view.take();
+            consecutive_resolve_failures = 0;
+            consecutive_probe_failures = 0;
+            list = final_list;
+            job.list_value = final_list.0 as usize;
+            continue;
+        }
+        job.desired = match unsafe { desired_drop_position(final_list, job.screen_point) } {
+            Ok(desired) => desired,
+            Err("auto_arrange") => {
+                return WorkerOutcome {
+                    outcome: "desktop_position_auto_arrange",
+                    positioned: false,
+                };
+            }
+            Err(_) => {
+                return WorkerOutcome {
+                    outcome: "desktop_position_geometry_failed_before_write",
+                    positioned: false,
+                };
+            }
+        };
+        job.desired_ready = true;
+        if crate::utils::find_desktop_listview() != Some(list) {
+            pidl.take();
+            view.take();
+            continue;
+        }
+        if let Some(outcome) = worker_gate(job, new_pointer_press) {
+            return outcome;
+        }
+        if position.x == job.desired.x && position.y == job.desired.y {
+            return WorkerOutcome {
+                outcome: "desktop_already_positioned",
+                positioned: true,
+            };
+        }
+
+        let child = pidl.as_ref().expect("pidl resolved").0 as *const ITEMIDLIST;
+        let position_started = job.trace.stage_start();
+        let positioned = unsafe {
+            view
+                .as_ref()
+                .expect("view acquired")
+                .SelectAndPositionItems(
+                    1,
+                    &child,
+                    Some(&job.desired),
+                    SVSI_POSITIONITEM.0 as u32,
+                )
+                .is_ok()
+        };
+        job.trace
+            .finish_stage("desktop_position", position_started, || {
+                format!(
+                    "scope=worker ok={positioned} requested_x={} requested_y={}",
+                    job.desired.x, job.desired.y
+                )
+            });
+        crate::dlog(&format!(
+            "[desktop-drop] item=\"{}\" method=folder-view-worker release=({}, {}) requested=({}, {}) positioned={}",
+            job.label,
+            job.screen_point.x,
+            job.screen_point.y,
+            job.desired.x,
+            job.desired.y,
+            positioned
+        ));
+        return WorkerOutcome {
+            outcome: if positioned {
+                "desktop_positioned"
+            } else {
+                "desktop_position_failed"
+            },
+            positioned,
+        };
+    }
+}
+
+struct PointerPressWatch {
+    pressed: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+}
+
+impl PointerPressWatch {
+    fn start(generation: u64, deadline: Instant) -> std::io::Result<Self> {
+        let pressed = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_pressed = Arc::clone(&pressed);
+        let thread_stop = Arc::clone(&stop);
+        thread::Builder::new()
+            .name(format!("feather-pointer-watch-{generation}"))
+            .spawn(move || {
+                while Instant::now() < deadline && !thread_stop.load(Ordering::Acquire) {
+                    let state = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16;
+                    if pointer_state_has_press(state) {
+                        thread_pressed.store(true, Ordering::Release);
+                        break;
+                    }
+                    thread::sleep(POINTER_WATCH_POLL);
+                }
+            })?;
+        Ok(Self { pressed, stop })
+    }
+}
+
+impl Drop for PointerPressWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+struct ActiveDropWorkerGuard;
+
+impl Drop for ActiveDropWorkerGuard {
+    fn drop(&mut self) {
+        ACTIVE_DROP_POSITION_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn run_drop_position_worker(mut job: DesktopDropJob) {
+    let _active_guard = ActiveDropWorkerGuard;
+    let pointer_watch = match PointerPressWatch::start(
+        job.generation,
+        job.released_at + DROP_POSITION_TIMEOUT,
+    ) {
+        Ok(watch) => watch,
+        Err(_) => {
+            finish_drop_job(
+                job,
+                "desktop_position_pointer_watch_failed",
+                false,
+            );
+            return;
+        }
+    };
+    let initialized = unsafe {
+        CoInitializeEx(
+            None,
+            COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+        )
+    };
+    let outcome = if initialized.is_ok() {
+        prepare_sta_message_queue();
+        let outcome = unsafe { position_on_worker(&mut job, &pointer_watch.pressed) };
+        unsafe { CoUninitialize() };
+        outcome
+    } else {
+        WorkerOutcome {
+            outcome: "desktop_position_worker_com_init_failed",
+            positioned: false,
+        }
+    };
+    finish_drop_job(job, outcome.outcome, outcome.positioned);
+}
+
+/// Queue a bounded background-STA job that waits for Explorer to publish the new desktop item.
+/// The UI thread performs only cheap validation and never runs Shell COM or sleeps.
+pub(crate) fn queue_file_at_drop_point(
+    _owner_hwnd: HWND,
+    source_path: &Path,
+    name_state: DesktopNameState,
+    screen_point: POINT,
+    released_at: Instant,
+    trace: crate::perf::DropTrace,
+) -> QueueDropPosition {
+    match name_state {
+        DesktopNameState::Present => {
+            trace.event("desktop_position_rejected", || {
+                "reason=desktop_name_preexisting".to_string()
+            });
+            return QueueDropPosition::Rejected;
+        }
+        DesktopNameState::Unknown => {
+            trace.event("desktop_position_rejected", || {
+                "reason=desktop_name_unknown".to_string()
+            });
+            return QueueDropPosition::Rejected;
+        }
+        DesktopNameState::Absent => {}
+    }
+    let deadline = released_at + DROP_POSITION_TIMEOUT;
+    if Instant::now() >= deadline {
+        trace.event("desktop_position_rejected", || {
+            format!(
+                "reason=release_deadline_elapsed release_age_us={}",
+                released_at.elapsed().as_micros()
+            )
+        });
+        return QueueDropPosition::Rejected;
+    }
+    let Some(label_os) = source_path.file_name() else {
+        trace.event("desktop_position_rejected", || "reason=missing_label".to_string());
+        return QueueDropPosition::Rejected;
+    };
+    let label = label_os.to_string_lossy().into_owned();
+    let Some(list) = crate::utils::find_desktop_listview() else {
+        trace.event("desktop_position_rejected", || {
+            "reason=desktop_list_missing".to_string()
+        });
+        return QueueDropPosition::Rejected;
+    };
+    if !unsafe { point_hits_desktop_list(list, screen_point) } {
+        trace.event("desktop_position_rejected", || {
+            "reason=release_not_on_desktop".to_string()
+        });
+        return QueueDropPosition::Rejected;
+    }
+    let generation = next_drop_generation();
+    let label_w: Vec<u16> = label_os.encode_wide().chain(std::iter::once(0)).collect();
+    let started = Instant::now();
+    // Explorer may keep OLE busy long after the physical release. Count the publish grace period
+    // from that release so the background worker does not add another fixed delay afterward.
+    let not_before = released_at + DROP_POSITION_SETTLE_DELAY;
+    let job = DesktopDropJob {
+        generation,
+        label,
+        label_w,
+        screen_point,
+        list_value: list.0 as usize,
+        desired: POINT::default(),
+        desired_ready: false,
+        started,
+        released_at,
+        not_before,
+        attempts: 0,
+        view_attempts: 0,
+        resolve_attempts: 0,
+        probe_attempts: 0,
+        appeared: false,
+        trace,
+        total_started: trace.stage_start(),
+    };
+
+    // Clear the completed drag's transition. The short-lived watcher then observes only a new
+    // left press, so keyboard releases and ordinary pointer movement do not cancel positioning.
+    let button_baseline = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16;
+    if pointer_state_has_press(button_baseline) {
+        trace.event("desktop_position_rejected", || {
+            "reason=new_pointer_interaction".to_string()
+        });
+        return QueueDropPosition::Rejected;
+    }
+    if current_drop_generation() != generation {
+        trace.event("desktop_position_rejected", || {
+            "reason=superseded_before_queue".to_string()
+        });
+        return QueueDropPosition::Rejected;
+    }
+    if ACTIVE_DROP_POSITION_WORKERS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < MAX_DROP_POSITION_WORKERS).then_some(active + 1)
+        })
+        .is_err()
+    {
+        trace.event("desktop_position_rejected", || {
+            "reason=worker_limit".to_string()
+        });
+        return QueueDropPosition::Rejected;
+    }
+    let spawn = thread::Builder::new()
+        .name(format!("feather-desktop-drop-{generation}"))
+        .spawn(move || run_drop_position_worker(job));
+    if let Err(error) = spawn {
+        ACTIVE_DROP_POSITION_WORKERS.fetch_sub(1, Ordering::AcqRel);
+        trace.event("desktop_position_rejected", || {
+            format!("reason=worker_spawn_failed error={error}")
+        });
+        return QueueDropPosition::Rejected;
+    }
+    trace.event("desktop_position_queued", || {
+        format!(
+            "scope=worker timeout_ms={} settle_delay_ms={} pointer_watch_ms={} requested=pending",
+            DROP_POSITION_TIMEOUT.as_millis(), DROP_POSITION_SETTLE_DELAY.as_millis(),
+            POINTER_WATCH_POLL.as_millis(),
+        )
+    });
+    QueueDropPosition::Queued
+}
+
+pub(crate) fn cancel_pending_drop_position(_owner_hwnd: HWND, _reason: &'static str) {
+    next_drop_generation();
+}
+
+pub(crate) fn shutdown_drop_positioner(owner_hwnd: HWND) {
+    cancel_pending_drop_position(owner_hwnd, "desktop_position_shutdown");
+}
+
+/// 记录栅栏移动/缩放前的配置快照(每个 id 只记一次)。由栅栏 WM_LBUTTONDOWN
+/// 进入拖动/缩放时调用——此时窗口还在原位。
 pub fn record_fence(cfg: &crate::config::FenceCfg) {
     let now = now_unix();
     let mut guard = FENCE_HISTORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -590,12 +1126,21 @@ pub fn restore_autoarrange() {
 
 #[cfg(test)]
 mod drop_position_tests {
-    use super::centered_icon_position;
+    use super::{
+        centered_icon_position, pointer_state_has_press, position_attempt_gate,
+        PositionAttemptGate,
+    };
+    use std::time::Duration;
     use windows::Win32::Foundation::{POINT, RECT};
 
     #[test]
     fn release_point_centres_and_clamps_the_icon_cell() {
-        let client = RECT { left: 0, top: 0, right: 1000, bottom: 800 };
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 800,
+        };
         assert_eq!(
             centered_icon_position(POINT { x: 500, y: 400 }, client, 100, 80),
             POINT { x: 450, y: 360 }
@@ -604,5 +1149,38 @@ mod drop_position_tests {
             centered_icon_position(POINT { x: 5, y: 5 }, client, 100, 80),
             POINT { x: 0, y: 0 }
         );
+        assert_eq!(
+            centered_icon_position(POINT { x: 995, y: 795 }, client, 100, 80),
+            POINT { x: 900, y: 720 }
+        );
     }
+
+    #[test]
+    fn deadline_is_strict_at_2000_milliseconds() {
+        assert_eq!(
+            position_attempt_gate(Duration::from_millis(1999), false),
+            PositionAttemptGate::Continue
+        );
+        assert_eq!(
+            position_attempt_gate(Duration::from_millis(2000), false),
+            PositionAttemptGate::Expired
+        );
+    }
+
+    #[test]
+    fn new_input_cancels_before_the_write() {
+        assert_eq!(
+            position_attempt_gate(Duration::from_millis(100), true),
+            PositionAttemptGate::Cancelled
+        );
+    }
+
+    #[test]
+    fn pointer_press_gate_accepts_current_or_completed_clicks() {
+        assert!(!pointer_state_has_press(0));
+        assert!(pointer_state_has_press(0x8000));
+        assert!(pointer_state_has_press(0x0001));
+        assert!(pointer_state_has_press(0x8001));
+    }
+
 }

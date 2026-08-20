@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static SAFE_DESKTOP: OnceLock<bool> = OnceLock::new();
+static TARGETABLE_WINDOW: OnceLock<bool> = OnceLock::new();
 static LOG_TX: OnceLock<Sender<String>> = OnceLock::new();
 static ANIMATIONS: OnceLock<Mutex<HashMap<u32, AnimationSession>>> = OnceLock::new();
 static DROP_POSTED: OnceLock<Mutex<HashMap<u32, Instant>>> = OnceLock::new();
@@ -263,6 +264,12 @@ pub fn safe_desktop() -> bool {
     enabled() && *SAFE_DESKTOP.get_or_init(|| env_flag("FEATHER_PERF_SAFE_DESKTOP"))
 }
 
+/// Makes the profiling build discoverable by the safe Windows UI test driver.
+/// Production window styles are unchanged unless profiling and this explicit flag are both on.
+pub fn targetable_window() -> bool {
+    enabled() && *TARGETABLE_WINDOW.get_or_init(|| env_flag("FEATHER_PERF_TARGETABLE"))
+}
+
 pub fn animation_fence_id() -> Option<u32> {
     enabled()
         .then(|| std::env::var("FEATHER_PERF_ANIMATE_FENCE").ok())
@@ -286,8 +293,10 @@ pub fn init() {
         // Allocate the correlation table before any drag callback/global-state borrow.
         let _ = drop_posted();
         emit(format!(
-            "[perf][session] pid={} profiling=enabled",
-            std::process::id()
+            "[perf][session] pid={} profiling=enabled safe_desktop={} targetable={}",
+            std::process::id(),
+            safe_desktop(),
+            targetable_window(),
         ));
     }
 }
