@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -11,6 +12,198 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 static SAFE_DESKTOP: OnceLock<bool> = OnceLock::new();
 static LOG_TX: OnceLock<Sender<String>> = OnceLock::new();
 static ANIMATIONS: OnceLock<Mutex<HashMap<u32, AnimationSession>>> = OnceLock::new();
+static DROP_POSTED: OnceLock<Mutex<HashMap<u32, Instant>>> = OnceLock::new();
+static NEXT_DROP_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Correlates the stages of one incoming or outgoing drag/drop operation.
+/// A disabled trace has id 0 and does not read the clock or allocate log strings.
+#[derive(Clone, Copy, Debug)]
+pub struct DropTrace {
+    id: u32,
+    started: Option<Instant>,
+}
+
+impl DropTrace {
+    pub fn begin(direction: &str, items: usize) -> Self {
+        let trace = Self::start();
+        trace.announce(direction, items);
+        trace
+    }
+
+    /// Starts the clock without emitting a log line. This is used while the global UI state is
+    /// borrowed; `announce` is called immediately after leaving that critical section.
+    pub fn start() -> Self {
+        if !enabled() {
+            return Self {
+                id: 0,
+                started: None,
+            };
+        }
+
+        let id = next_drop_id();
+        let started = Instant::now();
+        Self {
+            id,
+            started: Some(started),
+        }
+    }
+
+    pub fn announce(self, direction: &str, items: usize) {
+        let Some(started) = self.started else {
+            return;
+        };
+        emit(format!(
+            "[perf][drop] op={} event=begin direction={direction} items_hint={items} since_origin_us={}",
+            self.id,
+            micros(started.elapsed())
+        ));
+    }
+
+    pub fn id(self) -> u32 {
+        self.id
+    }
+
+    pub fn stage_start(self) -> Option<Instant> {
+        self.started.map(|_| Instant::now())
+    }
+
+    pub fn elapsed(self) -> Option<Duration> {
+        self.started.map(|started| started.elapsed())
+    }
+
+    pub fn finish_stage<F>(self, stage: &str, stage_started: Option<Instant>, details: F)
+    where
+        F: FnOnce() -> String,
+    {
+        let Some(stage_started) = stage_started else {
+            return;
+        };
+        self.record_stage(stage, stage_started.elapsed(), details);
+    }
+
+    pub fn record_stage<F>(self, stage: &str, elapsed: Duration, details: F)
+    where
+        F: FnOnce() -> String,
+    {
+        let Some(operation_started) = self.started else {
+            return;
+        };
+        emit(format!(
+            "[perf][drop] op={} event=stage stage={stage} elapsed_us={} since_begin_us={} {}",
+            self.id,
+            micros(elapsed),
+            micros(operation_started.elapsed()),
+            details()
+        ));
+    }
+
+    pub fn event<F>(self, event: &str, details: F)
+    where
+        F: FnOnce() -> String,
+    {
+        let Some(started) = self.started else {
+            return;
+        };
+        emit(format!(
+            "[perf][drop] op={} event={event} since_begin_us={} {}",
+            self.id,
+            micros(started.elapsed()),
+            details()
+        ));
+    }
+
+    pub fn finish<F>(self, outcome: &str, details: F)
+    where
+        F: FnOnce() -> String,
+    {
+        let Some(started) = self.started else {
+            return;
+        };
+        emit(format!(
+            "[perf][drop] op={} event=finish outcome={outcome} total_us={} {}",
+            self.id,
+            micros(started.elapsed()),
+            details()
+        ));
+    }
+}
+
+/// Records a stage completed later from a posted window message. The operation id is carried
+/// in WPARAM, so this does not keep COM objects or heap allocations alive across the message.
+pub fn drop_stage_start(operation_id: u32) -> Option<Instant> {
+    (operation_id != 0 && enabled()).then(Instant::now)
+}
+
+pub fn record_drop_stage<F>(operation_id: u32, stage: &str, elapsed: Duration, details: F)
+where
+    F: FnOnce() -> String,
+{
+    if operation_id == 0 || !enabled() {
+        return;
+    }
+    emit(format!(
+        "[perf][drop] op={operation_id} event=stage stage={stage} elapsed_us={} {}",
+        micros(elapsed),
+        details()
+    ));
+}
+
+pub fn record_drop_event<F>(operation_id: u32, event: &str, details: F)
+where
+    F: FnOnce() -> String,
+{
+    if operation_id == 0 || !enabled() {
+        return;
+    }
+    emit(format!(
+        "[perf][drop] op={operation_id} event={event} {}",
+        details()
+    ));
+}
+
+pub fn mark_drop_posted(operation_id: u32) {
+    if operation_id == 0 || !enabled() {
+        return;
+    }
+    drop_posted()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(operation_id, Instant::now());
+}
+
+pub fn cancel_drop_posted(operation_id: u32) {
+    if operation_id == 0 || !enabled() {
+        return;
+    }
+    drop_posted()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&operation_id);
+}
+
+pub fn take_drop_post_delay(operation_id: u32) -> Option<Duration> {
+    if operation_id == 0 || !enabled() {
+        return None;
+    }
+    drop_posted()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&operation_id)
+        .map(|posted| posted.elapsed())
+}
+
+fn next_drop_id() -> u32 {
+    loop {
+        let id = NEXT_DROP_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
+fn drop_posted() -> &'static Mutex<HashMap<u32, Instant>> {
+    DROP_POSTED.get_or_init(|| Mutex::new(HashMap::with_capacity(8)))
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RenderSample {
@@ -90,6 +283,8 @@ pub fn animation_repeats() -> u32 {
 
 pub fn init() {
     if enabled() {
+        // Allocate the correlation table before any drag callback/global-state borrow.
+        let _ = drop_posted();
         emit(format!(
             "[perf][session] pid={} profiling=enabled",
             std::process::id()

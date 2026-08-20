@@ -6,7 +6,8 @@
 use std::cell::Cell;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use windows::core::{implement, Error, Ref, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{
@@ -40,7 +41,7 @@ fn final_drop_effect(ole_effect: DROPEFFECT, shell_reported: u32) -> DROPEFFECT 
 }
 
 /// 拖出指定路径:阻塞到拖拽结束。返回实际拖放效果(MOVE/COPY/NONE)。
-pub fn start_drag(paths: Vec<String>) -> DROPEFFECT {
+pub fn start_drag(paths: Vec<String>, trace: crate::perf::DropTrace) -> DROPEFFECT {
     crate::dlog(&format!("[dragout] start drag: {}", paths.join("; ")));
     unsafe {
         let performed_effect = Arc::new(AtomicU32::new(DROPEFFECT_NONE.0));
@@ -49,7 +50,11 @@ pub fn start_drag(paths: Vec<String>) -> DROPEFFECT {
             performed_effect: Arc::clone(&performed_effect),
         }
         .into();
-        let src: IDropSource = FileDropSource.into();
+        let released_at = (trace.id() != 0).then(|| Arc::new(OnceLock::new()));
+        let src: IDropSource = FileDropSource {
+            released_at: released_at.clone(),
+        }
+        .into();
         let mut effect = DROPEFFECT_NONE;
         let hr = DoDragDrop(
             &dataobj,
@@ -67,6 +72,17 @@ pub fn start_drag(paths: Vec<String>) -> DROPEFFECT {
         } else {
             "none"
         };
+        if let Some(released_at) = released_at
+            .as_ref()
+            .and_then(|released_at| released_at.get())
+        {
+            trace.record_stage("release_to_ole_return", released_at.elapsed(), || {
+                format!(
+                    "scope=exclusive hr=0x{:08x} ole_effect={} shell_effect={} final={name}",
+                    hr.0 as u32, effect.0, shell_reported
+                )
+            });
+        }
         crate::dlog(&format!(
             "[dragout] DoDragDrop hr=0x{:08x} effect={} performed={} final={}",
             hr.0 as u32,
@@ -393,13 +409,18 @@ mod tests {
 
 /// 拖拽过程控制:Esc 取消;松开左键 → 落下;GiveFeedback 用 OLE 默认光标。
 #[implement(IDropSource)]
-pub struct FileDropSource;
+pub struct FileDropSource {
+    released_at: Option<Arc<OnceLock<Instant>>>,
+}
 
 impl IDropSource_Impl for FileDropSource_Impl {
     fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
         if fescapepressed.as_bool() {
             DRAGDROP_S_CANCEL
         } else if !grfkeystate.contains(MK_LBUTTON) {
+            if let Some(released_at) = &self.released_at {
+                let _ = released_at.set(Instant::now());
+            }
             DRAGDROP_S_DROP
         } else {
             S_OK

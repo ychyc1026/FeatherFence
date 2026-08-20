@@ -376,11 +376,28 @@ fn format_drop_failures(
 }
 
 /// 处理拖入并返回是否至少复制/移动了一个项目，供 OLE 向数据源报告真实结果。
-pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>, copy_requested: bool) -> bool {
+pub(crate) fn handle_drop(
+    hwnd: HWND,
+    paths: Vec<String>,
+    copy_requested: bool,
+    trace: crate::perf::DropTrace,
+) -> bool {
+    let item_count = paths.len();
+    let global_started = trace.stage_start();
+    let mut fence_id = 0u32;
+    let mut resolve_elapsed = None;
+    let mut file_ops_elapsed = None;
+    let mut max_item_elapsed: Option<std::time::Duration> = None;
+    let mut notify_elapsed = None;
+    let mut missing = 0usize;
+    let mut same_dir_skipped = 0usize;
+    let mut post_ok = false;
     let result = with_global(|g| {
         let Some(idx) = g.fences.iter().position(|f| f.valid && f.hwnd == hwnd) else {
             return None;
         };
+        fence_id = g.fences[idx].cfg.id;
+        let resolve_started = trace.stage_start();
         let target = if let Some(folder) = g.fences[idx].cfg.folder.clone() {
             folder
         } else {
@@ -390,15 +407,19 @@ pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>, copy_requested: bool) 
                     .iter()
                     .map(|path| (path.clone(), "无法创建或访问栅栏存储目录".to_string()))
                     .collect();
+                resolve_elapsed = resolve_started.map(|started| started.elapsed());
                 return Some((vault, 0, failures));
             }
             vault
         };
+        resolve_elapsed = resolve_started.map(|started| started.elapsed());
         let mut succeeded = 0usize;
         let mut failures = Vec::new();
+        let operations_started = trace.stage_start();
         for p in &paths {
             let src = PathBuf::from(p);
             if !src.exists() {
+                missing += 1;
                 failures.push((p.clone(), "源项目不存在或已被移动".to_string()));
                 continue;
             }
@@ -406,13 +427,22 @@ pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>, copy_requested: bool) 
             if !copy_requested
                 && src.parent().map(|d| d == target.as_path()).unwrap_or(false)
             {
+                same_dir_skipped += 1;
                 continue;
             }
+            let item_started = trace.stage_start();
             let operation = if copy_requested {
                 watcher::copy_to_dir(&src, &target)
             } else {
                 watcher::move_to_dir(&src, &target)
             };
+            if let Some(elapsed) = item_started.map(|started| started.elapsed()) {
+                max_item_elapsed = Some(
+                    max_item_elapsed
+                        .map(|current| current.max(elapsed))
+                        .unwrap_or(elapsed),
+                );
+            }
             match operation {
                 Ok(_) => succeeded += 1,
                 Err(e) => {
@@ -422,11 +452,25 @@ pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>, copy_requested: bool) 
                 }
             }
         }
+        file_ops_elapsed = operations_started.map(|started| started.elapsed());
         if succeeded > 0 {
-            unsafe { let _ = PostMessageW(Some(hwnd), WM_APP_DROP, WPARAM(0), LPARAM(0)); };
+            perf::mark_drop_posted(trace.id());
+            post_ok = unsafe {
+                PostMessageW(
+                    Some(hwnd),
+                    WM_APP_DROP,
+                    WPARAM(trace.id() as usize),
+                    LPARAM(0),
+                )
+            }
+            .is_ok();
+            if !post_ok {
+                perf::cancel_drop_posted(trace.id());
+            }
         }
         if !failures.is_empty() {
             // 拖放失败静默是历史缺陷:至少给用户一个托盘气泡提示
+            let notify_started = trace.stage_start();
             tray::notify_tip(
                 g.msg_hwnd,
                 "轻栅栏",
@@ -435,16 +479,57 @@ pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>, copy_requested: bool) 
                     failures.len()
                 ),
             );
+            notify_elapsed = notify_started.map(|started| started.elapsed());
         }
         Some((target, succeeded, failures))
     });
 
+    if let Some(started) = global_started {
+        trace.record_stage("drop_global_total", started.elapsed(), || {
+            format!("scope=aggregate fence={fence_id} found={}", result.is_some())
+        });
+    }
+    if let Some(elapsed) = resolve_elapsed {
+        trace.record_stage("resolve_target", elapsed, || {
+            format!("fence={fence_id}")
+        });
+    }
+    if let Some(elapsed) = file_ops_elapsed {
+        trace.record_stage("file_operations", elapsed, || {
+            format!(
+                "scope=exclusive fence={fence_id} mode={} items={item_count} missing={missing} same_dir_skipped={same_dir_skipped} max_item_us={} post_ok={post_ok}",
+                if copy_requested { "copy" } else { "move" },
+                max_item_elapsed
+                    .map(|duration| duration.as_micros())
+                    .unwrap_or_default()
+            )
+        });
+    }
+    if let Some(elapsed) = notify_elapsed {
+        trace.record_stage("drop_notification", elapsed, || {
+            format!("fence={fence_id}")
+        });
+    }
+
     let Some((target, succeeded, failures)) = result else {
+        trace.event("file_result", || {
+            format!("fence=0 items={item_count} succeeded=0 failed=0 reason=fence_missing")
+        });
         return false;
     };
+    trace.event("file_result", || {
+        format!(
+            "fence={fence_id} items={item_count} succeeded={succeeded} failed={} missing={missing} same_dir_skipped={same_dir_skipped} post_ok={post_ok}",
+            failures.len()
+        )
+    });
+    if succeeded > 0 && !post_ok {
+        trace.event("refresh_post_failed", || format!("fence={fence_id}"));
+    }
     if !failures.is_empty() {
         let message = format_drop_failures(&target, succeeded, &failures, copy_requested);
         let message_w = wstr(&message);
+        let feedback_started = trace.stage_start();
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
                 Some(hwnd),
@@ -453,6 +538,9 @@ pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>, copy_requested: bool) 
                 windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE(0x10),
             );
         }
+        trace.finish_stage("drop_feedback", feedback_started, || {
+            format!("fence={fence_id} failures={}", failures.len())
+        });
     }
     succeeded > 0
 }

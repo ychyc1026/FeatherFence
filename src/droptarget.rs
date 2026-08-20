@@ -20,6 +20,7 @@ use windows::Win32::UI::Shell::{DragQueryFileW, ILCombine, ILFree, SHGetPathFrom
 pub struct FenceDropTarget {
     pub hwnd: HWND,
     accepts: Cell<bool>,
+    trace: Cell<Option<crate::perf::DropTrace>>,
 }
 
 impl FenceDropTarget {
@@ -27,6 +28,7 @@ impl FenceDropTarget {
         FenceDropTarget {
             hwnd,
             accepts: Cell::new(false),
+            trace: Cell::new(None),
         }
     }
 }
@@ -177,13 +179,30 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
         pdweffect: *mut DROPEFFECT,
     ) -> Result<()> {
         unsafe {
+            if let Some(previous) = self.trace.take() {
+                previous.finish("superseded", || "reason=new_drag_enter".to_string());
+            }
+            let trace = crate::perf::DropTrace::begin("in", 0);
+            let supports_started = trace.stage_start();
+            let allowed_effect = *pdweffect;
             let accepts = supports_paths(dataobj.as_ref());
+            trace.finish_stage("drag_enter_supports", supports_started, || {
+                format!("scope=exclusive accepted={accepts}")
+            });
             self.accepts.set(accepts);
             *pdweffect = if accepts {
                 pick_effect(*pdweffect, keys)
             } else {
                 DROPEFFECT_NONE
             };
+            trace.event("drag_enter", || {
+                format!(
+                    "accepted={accepts} allowed_bits={} selected_bits={}",
+                    allowed_effect.0,
+                    (*pdweffect).0
+                )
+            });
+            self.trace.set(Some(trace));
         }
         Ok(())
     }
@@ -206,6 +225,9 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
 
     fn DragLeave(&self) -> Result<()> {
         self.accepts.set(false);
+        if let Some(trace) = self.trace.take() {
+            trace.finish("left_target", || "dropped=false".to_string());
+        }
         Ok(())
     }
 
@@ -218,18 +240,67 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
     ) -> Result<()> {
         unsafe {
             self.accepts.set(false);
+            let trace = self
+                .trace
+                .take()
+                .unwrap_or_else(|| crate::perf::DropTrace::begin("in", 0));
+            let callback_started = trace.stage_start();
+            let extract_started = trace.stage_start();
             let paths = extract_paths(dataobj.as_ref());
+            trace.finish_stage("extract_paths", extract_started, || {
+                format!("items={}", paths.len())
+            });
             if paths.is_empty() {
                 *pdweffect = DROPEFFECT_NONE;
+                trace.finish_stage("drop_callback_total", callback_started, || {
+                    "scope=aggregate items=0 accepted=false".to_string()
+                });
+                trace.finish("rejected", || "reason=no_paths".to_string());
                 return Ok(());
             }
+            let allowed_effect = *pdweffect;
             let selected = pick_effect(*pdweffect, keys);
             let copy_requested = selected == DROPEFFECT_COPY;
-            *pdweffect = if crate::handle_drop(self.hwnd, paths, copy_requested) {
+            let item_count = paths.len();
+            trace.event("effect_selected", || {
+                format!(
+                    "items={item_count} ctrl={} allowed_bits={} selected_bits={}",
+                    keys.contains(MK_CONTROL),
+                    allowed_effect.0,
+                    selected.0
+                )
+            });
+            let handler_started = trace.stage_start();
+            let handled = crate::handle_drop(self.hwnd, paths, copy_requested, trace);
+            trace.finish_stage("drop_handler_total", handler_started, || {
+                format!("scope=aggregate items={item_count} accepted={handled}")
+            });
+            *pdweffect = if handled {
                 selected
             } else {
                 DROPEFFECT_NONE
             };
+            trace.finish_stage("drop_callback_total", callback_started, || {
+                format!(
+                    "scope=aggregate items={item_count} copy={copy_requested} accepted={handled} final_bits={}",
+                    (*pdweffect).0
+                )
+            });
+            if handled {
+                trace.event("callback_return", || {
+                    format!(
+                        "items={item_count} copy={copy_requested} final_bits={} excludes_async_refresh=true",
+                        (*pdweffect).0
+                    )
+                });
+            } else {
+                trace.finish("failed", || {
+                    format!(
+                        "items={item_count} copy={copy_requested} final_bits={}",
+                        (*pdweffect).0
+                    )
+                });
+            }
         }
         Ok(())
     }

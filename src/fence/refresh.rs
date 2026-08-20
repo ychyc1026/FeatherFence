@@ -79,11 +79,24 @@ pub(crate) fn restart_refresh_timer(hwnd: HWND, delay_ms: u32) -> bool {
 }
 
 pub(crate) fn refresh_fence_now(g: &mut Global, idx: usize) {
+    let _ = refresh_fence_now_timed(g, idx, 0);
+}
+
+pub(crate) fn refresh_fence_now_timed(
+    g: &mut Global,
+    idx: usize,
+    operation_id: u32,
+) -> (Option<Duration>, Option<Duration>) {
     let ghost = g.config.ghost_mode;
     let vault = crate::config::vault_dir(&g.config);
     let f = &mut g.fences[idx];
+    let scan_started = crate::perf::drop_stage_start(operation_id);
     refresh_entries(f, &vault);
+    let scan_elapsed = scan_started.map(|started| started.elapsed());
+    let render_started = crate::perf::drop_stage_start(operation_id);
     render_fence(&mut g.icons, ghost, f);
+    let render_elapsed = render_started.map(|started| started.elapsed());
+    (scan_elapsed, render_elapsed)
 }
 #[cfg(test)]
 mod refresh_tests {

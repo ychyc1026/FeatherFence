@@ -44,8 +44,8 @@ use super::grid::{
 };
 use super::menu::{fence_menu, rename_fence};
 use super::refresh::{
-    refresh_entries, refresh_fence_now, restart_refresh_timer, stop_refresh_timer,
-    REFRESH_DEBOUNCE_MS, REFRESH_TICK,
+    refresh_entries, refresh_fence_now, refresh_fence_now_timed, restart_refresh_timer,
+    stop_refresh_timer, REFRESH_DEBOUNCE_MS, REFRESH_TICK,
 };
 use super::render::{continue_perf_animation, render_fence};
 use super::{RefreshTimerAction, ResizeDir, WM_APP_DESKTOP_RESTORE, WM_APP_DROP, WM_APP_REFRESH};
@@ -307,13 +307,67 @@ unsafe extern "system" fn fence_wndproc(
             return LRESULT(0);
         }
         WM_APP_DROP => {
-            with_global(|g| {
-                if let Some(idx) = fence_idx(g, hwnd) {
-                    g.fences[idx].refresh_signal.cancel();
-                    stop_refresh_timer(hwnd);
-                    refresh_fence_now(g, idx);
-                }
+            let operation_id = wparam.0 as u32;
+            if let Some(delay) = crate::perf::take_drop_post_delay(operation_id) {
+                crate::perf::record_drop_stage(
+                    operation_id,
+                    "post_to_refresh_start",
+                    delay,
+                    || "scope=exclusive".to_string(),
+                );
+            }
+            let refresh_total_started = crate::perf::drop_stage_start(operation_id);
+            let refreshed = with_global(|g| {
+                let idx = fence_idx(g, hwnd)?;
+                let fence_id = g.fences[idx].cfg.id;
+                g.fences[idx].refresh_signal.cancel();
+                stop_refresh_timer(hwnd);
+                let timings = refresh_fence_now_timed(g, idx, operation_id);
+                Some((fence_id, timings))
             });
+            if let Some((fence_id, (scan_elapsed, render_elapsed))) = refreshed {
+                if let Some(elapsed) = scan_elapsed {
+                    crate::perf::record_drop_stage(
+                        operation_id,
+                        "fence_scan",
+                        elapsed,
+                        || format!("scope=exclusive fence={fence_id}"),
+                    );
+                }
+                if let Some(elapsed) = render_elapsed {
+                    crate::perf::record_drop_stage(
+                        operation_id,
+                        "fence_render",
+                        elapsed,
+                        || format!("scope=exclusive fence={fence_id}"),
+                    );
+                }
+                if let Some(started) = refresh_total_started {
+                    crate::perf::record_drop_stage(
+                        operation_id,
+                        "fence_refresh_render_total",
+                        started.elapsed(),
+                        || format!("scope=aggregate fence={fence_id} found=true"),
+                    );
+                }
+                crate::perf::record_drop_event(
+                    operation_id,
+                    "visible_refresh_complete",
+                    || format!("fence={fence_id} found=true"),
+                );
+            } else if let Some(started) = refresh_total_started {
+                crate::perf::record_drop_stage(
+                    operation_id,
+                    "fence_refresh_render_total",
+                    started.elapsed(),
+                    || "scope=aggregate fence=0 found=false".to_string(),
+                );
+                crate::perf::record_drop_event(
+                    operation_id,
+                    "visible_refresh_complete",
+                    || "fence=0 found=false".to_string(),
+                );
+            }
             return LRESULT(0);
         }
         WM_KEYDOWN if wparam.0 == VK_DELETE.0 as usize => {
@@ -375,7 +429,7 @@ unsafe extern "system" fn fence_wndproc(
             }
             // 达到拖拽阈值后要启动的拖出(路径 + 目标目录),在 with_global 之外执行。
             // 复制/移动由 OLE 目标根据拖动过程中的实时按键决定。
-            let mut drag_path: Option<(String, PathBuf)> = None;
+            let mut drag_path: Option<(String, PathBuf, crate::perf::DropTrace)> = None;
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
                     let ghost = g.config.ghost_mode;
@@ -479,8 +533,11 @@ unsafe extern "system" fn fence_wndproc(
                                     if let Some(p) = f.entries.get(didx).map(|e| e.path.clone()) {
                                         unsafe { let _ = ReleaseCapture(); };
                                         let vault = crate::config::vault_dir(&g.config);
-                                        drag_path =
-                                            Some((p.to_string_lossy().to_string(), vault));
+                                        drag_path = Some((
+                                            p.to_string_lossy().to_string(),
+                                            vault,
+                                            crate::perf::DropTrace::start(),
+                                        ));
                                     }
                                 }
                                 need_render = true;
@@ -501,31 +558,113 @@ unsafe extern "system" fn fence_wndproc(
                 }
             });
             // 在锁外启动 OLE 拖出(阻塞到松手);拖出后文件可能被移动/删除 → 重扫目录刷新
-            if let Some((path, vault)) = drag_path {
+            if let Some((path, vault, trace)) = drag_path {
+                let threshold_elapsed = trace.elapsed();
+                trace.announce("out", 1);
+                if let Some(elapsed) = threshold_elapsed {
+                    trace.record_stage("threshold_to_ole", elapsed, || {
+                        "scope=exclusive includes_threshold_render=true".to_string()
+                    });
+                }
+                let shortcut_begin_started = trace.stage_start();
                 crate::begin_shortcut_dragout();
-                let effect = crate::dragout::start_drag(vec![path.clone()]);
+                trace.finish_stage("shortcut_begin", shortcut_begin_started, String::new);
+
+                let ole_started = trace.stage_start();
+                let effect = crate::dragout::start_drag(vec![path.clone()], trace);
+                trace.finish_stage("ole_modal", ole_started, || {
+                    format!(
+                        "scope=aggregate includes_pointer_hold=true effect_bits={}",
+                        effect.0
+                    )
+                });
+                let post_ole_started = trace.stage_start();
+
+                let desktop_check_started = trace.stage_start();
                 let mut release_point = POINT::default();
                 let have_release_point = GetCursorPos(&mut release_point).is_ok();
                 let dropped_on_desktop = effect.0 != 0
                     && have_release_point
                     && crate::desktop_icons::is_desktop_drop_point(release_point);
+                trace.finish_stage("desktop_check", desktop_check_started, || {
+                    format!(
+                        "effect_bits={} have_point={have_release_point} desktop={dropped_on_desktop}",
+                        effect.0
+                    )
+                });
+
+                let shortcut_finish_started = trace.stage_start();
                 crate::finish_shortcut_dragout(dropped_on_desktop);
-                if dropped_on_desktop {
+                trace.finish_stage("shortcut_finish", shortcut_finish_started, || {
+                    format!("desktop={dropped_on_desktop}")
+                });
+
+                let positioned = if dropped_on_desktop {
                     crate::desktop_icons::place_file_at_drop_point(
                         std::path::Path::new(&path),
                         release_point,
-                    );
-                }
+                        trace,
+                    )
+                } else {
+                    false
+                };
+
+                let mut fence_id = None;
+                let mut scan_elapsed = None;
+                let mut render_elapsed = None;
                 with_global(|g| {
                     if let Some(idx) = fence_idx(g, hwnd) {
                         let f = &mut g.fences[idx];
+                        fence_id = Some(f.cfg.id);
                         let keep_page = f.page;
+                        let scan_started = trace.stage_start();
                         refresh_entries(f, &vault);
+                        scan_elapsed = scan_started.map(|started| started.elapsed());
                         // 拖出后尽量留在原页(条目减少时收敛到最后一页)
                         f.page = keep_page.min(total_pages(f).saturating_sub(1));
                         f.top_row = f.page as f32 * grid_dims(f).1 as f32;
+                        let render_started = trace.stage_start();
                         render_fence(&mut g.icons, g.config.ghost_mode, f);
+                        render_elapsed = render_started.map(|started| started.elapsed());
                     }
+                });
+                if let Some(elapsed) = scan_elapsed {
+                    trace.record_stage("fence_scan", elapsed, || {
+                        format!(
+                            "scope=exclusive fence={}",
+                            fence_id.unwrap_or_default()
+                        )
+                    });
+                }
+                if let Some(elapsed) = render_elapsed {
+                    trace.record_stage("fence_render", elapsed, || {
+                        format!(
+                            "scope=exclusive fence={}",
+                            fence_id.unwrap_or_default()
+                        )
+                    });
+                }
+
+                trace.finish_stage("post_ole", post_ole_started, || {
+                    format!(
+                        "scope=aggregate effect_bits={} desktop={dropped_on_desktop} positioned={positioned}",
+                        effect.0
+                    )
+                });
+                let outcome = if effect.0 == 0 {
+                    "cancelled"
+                } else if dropped_on_desktop && positioned {
+                    "desktop_positioned"
+                } else if dropped_on_desktop {
+                    "desktop_unpositioned"
+                } else {
+                    "dropped_elsewhere"
+                };
+                trace.finish(outcome, || {
+                    format!(
+                        "effect_bits={} desktop={dropped_on_desktop} positioned={positioned}",
+                        effect.0
+                    )
                 });
             }
             return LRESULT(0);

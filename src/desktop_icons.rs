@@ -340,26 +340,42 @@ pub fn is_desktop_drop_point(screen_point: POINT) -> bool {
 /// If the OLE drop ended on Explorer's desktop, move the newly-created ListView item so its
 /// icon cell is centred on the actual mouse release point. Position through `IFolderView` so
 /// Explorer's own folder-view state and the visible ListView stay in sync.
-pub fn place_file_at_drop_point(source_path: &Path, screen_point: POINT) -> bool {
-    let Some(list) = crate::utils::find_desktop_listview() else {
-        return false;
-    };
-    unsafe {
+pub fn place_file_at_drop_point(
+    source_path: &Path,
+    screen_point: POINT,
+    trace: crate::perf::DropTrace,
+) -> bool {
+    let total_started = trace.stage_start();
+    let mut outcome = "desktop_list_missing";
+    let mut attempts = 0usize;
+    let mut sleep_count = 0usize;
+    let mut stable_samples = 0usize;
+    let mut appeared = false;
+
+    let positioned = (|| {
+        let Some(list) = crate::utils::find_desktop_listview() else {
+            return false;
+        };
+        unsafe {
         if !is_desktop_drop_point(screen_point) {
+            outcome = "release_not_on_desktop";
             return false;
         }
         let style = GetWindowLongPtrW(list, GWL_STYLE);
         if style & LVS_AUTOARRANGE as isize != 0 {
             crate::dlog("[desktop-drop] skipped positioning because desktop auto-arrange is on");
+            outcome = "auto_arrange";
             return false;
         }
 
         let mut client_point = screen_point;
         if !ScreenToClient(list, &mut client_point).as_bool() {
+            outcome = "screen_to_client_failed";
             return false;
         }
         let mut client = RECT::default();
         if GetClientRect(list, &mut client).is_err() {
+            outcome = "client_rect_failed";
             return false;
         }
         let packed = SendMessageW(
@@ -373,20 +389,33 @@ pub fn place_file_at_drop_point(source_path: &Path, screen_point: POINT) -> bool
         let cell_h = ((packed >> 16) as i32).max(48);
         let desired = centered_icon_position(client_point, client, cell_w, cell_h);
 
-        let view = match desktop_folder_view() {
+        let view_started = trace.stage_start();
+        let view_result = desktop_folder_view();
+        trace.finish_stage("desktop_view", view_started, || {
+            format!("scope=exclusive ok={}", view_result.is_ok())
+        });
+        let view = match view_result {
             Ok(view) => view,
             Err(error) => {
                 crate::dlog(&format!(
                     "[desktop-drop] could not acquire Explorer folder view: {error:?}"
                 ));
+                outcome = "folder_view_failed";
                 return false;
             }
         };
-        let Some((pidl, label)) = desktop_child_pidl(&view, source_path) else {
+
+        let resolve_started = trace.stage_start();
+        let resolved = desktop_child_pidl(&view, source_path);
+        trace.finish_stage("desktop_resolve_item", resolve_started, || {
+            format!("scope=exclusive ok={}", resolved.is_some())
+        });
+        let Some((pidl, label)) = resolved else {
             crate::dlog(&format!(
                 "[desktop-drop] could not resolve desktop item for {}",
                 source_path.display()
             ));
+            outcome = "resolve_item_failed";
             return false;
         };
 
@@ -394,9 +423,9 @@ pub fn place_file_at_drop_point(source_path: &Path, screen_point: POINT) -> bool
         // published the new item. Wait for a few identical positions, then position through
         // IFolderView so Explorer's model and the visible ListView are updated together.
         let mut last_position: Option<POINT> = None;
-        let mut stable_samples = 0usize;
-        let mut appeared = false;
+        let wait_started = trace.stage_start();
         for attempt in 0..DROP_ITEM_RETRIES {
+            attempts = attempt + 1;
             if let Ok(position) = view.GetItemPosition(pidl.0) {
                 appeared = true;
                 if last_position
@@ -413,19 +442,31 @@ pub fn place_file_at_drop_point(source_path: &Path, screen_point: POINT) -> bool
                 }
             }
             if attempt + 1 < DROP_ITEM_RETRIES {
+                sleep_count += 1;
                 std::thread::sleep(Duration::from_millis(DROP_ITEM_RETRY_DELAY_MS));
             }
         }
+        let wait_elapsed = wait_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        trace.finish_stage("desktop_wait", wait_started, || {
+            format!(
+                "scope=exclusive attempts={attempts} sleeps={sleep_count} stable_samples={stable_samples} appeared={appeared} wait_wall_us={}",
+                wait_elapsed.as_micros()
+            )
+        });
         if !appeared {
             crate::dlog(&format!(
                 "[desktop-drop] desktop item did not appear for {}",
                 source_path.display()
             ));
+            outcome = "item_not_appeared";
             return false;
         }
 
         let child = pidl.0 as *const ITEMIDLIST;
-        let positioned = view
+        let position_started = trace.stage_start();
+        let did_position = view
             .SelectAndPositionItems(
                 1,
                 &child,
@@ -433,12 +474,18 @@ pub fn place_file_at_drop_point(source_path: &Path, screen_point: POINT) -> bool
                 SVSI_POSITIONITEM.0 as u32,
             )
             .is_ok();
-        let actual = if positioned {
+        let actual = if did_position {
             view.GetItemPosition(pidl.0)
                 .unwrap_or(POINT { x: -1, y: -1 })
         } else {
             POINT { x: -1, y: -1 }
         };
+        trace.finish_stage("desktop_position", position_started, || {
+            format!(
+                "scope=exclusive ok={did_position} requested_x={} requested_y={} actual_x={} actual_y={}",
+                desired.x, desired.y, actual.x, actual.y
+            )
+        });
         crate::dlog(&format!(
             "[desktop-drop] item=\"{}\" method=folder-view release=({}, {}) requested=({}, {}) actual=({}, {}) positioned={}",
             label,
@@ -448,10 +495,23 @@ pub fn place_file_at_drop_point(source_path: &Path, screen_point: POINT) -> bool
             desired.y,
             actual.x,
             actual.y,
-            positioned
+            did_position
         ));
-        positioned
-    }
+        outcome = if did_position {
+            "positioned"
+        } else {
+            "position_failed"
+        };
+        did_position
+        }
+    })();
+
+    trace.finish_stage("desktop_position_total", total_started, || {
+        format!(
+            "scope=aggregate ok={positioned} outcome={outcome} attempts={attempts} sleeps={sleep_count} stable_samples={stable_samples} appeared={appeared}"
+        )
+    });
+    positioned
 }
 
 pub fn record_fence(cfg: &crate::config::FenceCfg) {
