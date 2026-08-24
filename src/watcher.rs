@@ -1,5 +1,6 @@
 // 目录监听:ReadDirectoryChangesW,文件夹门户实时刷新 + 桌面自动归类
 use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -9,11 +10,11 @@ use std::time::Duration;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
+    CreateFileW, MoveFileExW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
     FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME,
     FILE_NOTIFY_CHANGE_FILE_NAME, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    MOVE_FILE_FLAGS, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::CancelSynchronousIo;
 
@@ -458,6 +459,47 @@ pub fn copy_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+fn move_file_no_replace(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let source_w: Vec<u16> = src
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination_w: Vec<u16> = dest
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source_w.as_ptr()),
+            PCWSTR(destination_w.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    }
+    .map_err(|error| {
+        let hresult = error.code().0 as u32;
+        let raw = if hresult & 0xffff_0000 == 0x8007_0000 {
+            (hresult & 0xffff) as i32
+        } else {
+            hresult as i32
+        };
+        std::io::Error::from_raw_os_error(raw)
+    })
+}
+
+/// Move one item to its exact name without replacement or any copy/delete fallback. This is the
+/// final safety boundary for the desktop fast path; every error leaves the source untouched.
+pub fn move_to_dir_atomic_no_replace(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
+    if !dest_dir.is_dir() {
+        return Err("desktop directory is unavailable".to_string());
+    }
+    let name = src.file_name().ok_or("no file name")?.to_os_string();
+    let dest = dest_dir.join(name);
+    move_file_no_replace(src, &dest).map_err(|error| error.to_string())?;
+    Ok(dest)
+}
+
 /// 移动项目到目标目录（同卷 rename，跨卷文件 copy+delete），自动避免重名。
 pub fn move_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
     if !dest_dir.exists() {
@@ -506,7 +548,9 @@ pub fn unique_dest(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
 
 #[cfg(test)]
 mod move_tests {
-    use super::{copy_then_remove_file, copy_to_dir};
+    use super::{
+        copy_then_remove_file, copy_to_dir, move_to_dir_atomic_no_replace,
+    };
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::os::windows::fs::OpenOptionsExt;
@@ -580,6 +624,43 @@ mod move_tests {
         assert!(error.contains("复制失败"));
         assert!(src.exists());
         assert_eq!(std::fs::read(&dest).unwrap(), b"existing content");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_volume_move_never_overwrites_an_existing_destination() {
+        let dir = test_dir();
+        let source_dir = dir.join("source");
+        let destination_dir = dir.join("destination");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&destination_dir).unwrap();
+        let src = source_dir.join("item.txt");
+        let dest = destination_dir.join("item.txt");
+        std::fs::write(&src, b"source content").unwrap();
+        std::fs::write(&dest, b"existing content").unwrap();
+
+        move_to_dir_atomic_no_replace(&src, &destination_dir).unwrap_err();
+
+        assert_eq!(std::fs::read(&src).unwrap(), b"source content");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"existing content");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_volume_move_publishes_the_exact_destination_name() {
+        let dir = test_dir();
+        let source_dir = dir.join("source");
+        let destination_dir = dir.join("destination");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&destination_dir).unwrap();
+        let source = source_dir.join("item.txt");
+        std::fs::write(&source, b"content").unwrap();
+
+        let destination = move_to_dir_atomic_no_replace(&source, &destination_dir).unwrap();
+
+        assert_eq!(destination, destination_dir.join("item.txt"));
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(destination).unwrap(), b"content");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

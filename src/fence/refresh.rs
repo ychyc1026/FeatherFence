@@ -11,30 +11,38 @@ use super::grid::sync_page;
 use super::render::render_fence;
 use super::{Entry, Fence};
 
-pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) {
+/// Rescan a fence directory. Returns true only when the visible entry set changed.
+pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) -> bool {
     let profiling = crate::perf::enabled();
     let total_started = profiling.then(Instant::now);
     let page = f.page;
-    let selected_path = f.selected.and_then(|i| f.entries.get(i)).map(|e| e.path.clone());
-    f.entries.clear();
+    let selected_path = f
+        .selected
+        .and_then(|i| f.entries.get(i))
+        .map(|e| e.path.clone());
     let dir = f.cfg.folder.clone().unwrap_or_else(|| vault.clone());
+    let pending_outgoing = f.pending_outgoing.snapshot();
     let read_started = profiling.then(Instant::now);
     let read_time;
     let mut sort_time = Duration::default();
     let mut succeeded = false;
+    let mut next_entries = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         succeeded = true;
         for e in rd.flatten() {
             let path = e.path();
+            if pending_outgoing.contains(&path) {
+                continue;
+            }
             let name = e.file_name().to_string_lossy().to_string();
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            f.entries.push(Entry { path, name, is_dir });
+            next_entries.push(Entry { path, name, is_dir });
         }
         read_time = read_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
         let sort_started = profiling.then(Instant::now);
-        f.entries.sort_by(|a, b| {
+        next_entries.sort_by(|a, b| {
             b.is_dir
                 .cmp(&a.is_dir)
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
@@ -47,21 +55,27 @@ pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) {
             .map(|started| started.elapsed())
             .unwrap_or_default();
     }
-    f.selected = selected_path.and_then(|p| f.entries.iter().position(|e| e.path == p));
-    f.page = page;
-    f.wheel_acc = 0;
-    sync_page(f);
+    let changed = f.entries != next_entries;
     if let Some(started) = total_started {
         crate::perf::record_refresh(
             f.cfg.id,
             &dir,
-            f.entries.len(),
+            next_entries.len(),
             read_time,
             sort_time,
             started.elapsed(),
             succeeded,
         );
     }
+    if !changed {
+        return false;
+    }
+    f.entries = next_entries;
+    f.selected = selected_path.and_then(|p| f.entries.iter().position(|e| e.path == p));
+    f.page = page;
+    f.wheel_acc = 0;
+    sync_page(f);
+    true
 }
 /// 目录变化刷新计时器：连续事件安静一小段时间后再扫描和重绘。
 pub(crate) const REFRESH_TICK: usize = 0xFE11;
@@ -91,18 +105,22 @@ pub(crate) fn refresh_fence_now_timed(
     let vault = crate::config::vault_dir(&g.config);
     let f = &mut g.fences[idx];
     let scan_started = crate::perf::drop_stage_start(operation_id);
-    refresh_entries(f, &vault);
+    let changed = refresh_entries(f, &vault);
     let scan_elapsed = scan_started.map(|started| started.elapsed());
-    let render_started = crate::perf::drop_stage_start(operation_id);
-    render_fence(&mut g.icons, ghost, f);
-    let render_elapsed = render_started.map(|started| started.elapsed());
+    let render_elapsed = if changed {
+        let render_started = crate::perf::drop_stage_start(operation_id);
+        render_fence(&mut g.icons, ghost, f);
+        render_started.map(|started| started.elapsed())
+    } else {
+        None
+    };
     (scan_elapsed, render_elapsed)
 }
 #[cfg(test)]
 mod refresh_tests {
-    use super::{refresh_entries, REFRESH_DEBOUNCE_MS};
+    use super::{REFRESH_DEBOUNCE_MS, refresh_entries};
     use crate::config::FenceCfg;
-    use crate::fence::grid::{animation_progress, grid_dims, ANIM_DURATION};
+    use crate::fence::grid::{ANIM_DURATION, animation_progress, grid_dims};
     use crate::fence::{Fence, RefreshState, RefreshTimerAction};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use windows::Win32::Foundation::HWND;
@@ -159,16 +177,53 @@ mod refresh_tests {
         };
         let mut fence = Fence::new(cfg, HWND::default());
         fence.page = 1;
-        refresh_entries(&mut fence, &dir);
+        assert!(refresh_entries(&mut fence, &dir));
         assert_eq!(fence.page, 1);
         assert_eq!(fence.top_row, grid_dims(&fence).1 as f32);
+
+        fence.wheel_acc = 37;
+        assert!(!refresh_entries(&mut fence, &dir));
+        assert_eq!(fence.page, 1);
+        assert_eq!(fence.wheel_acc, 37);
 
         for entry in std::fs::read_dir(&dir).unwrap().flatten() {
             std::fs::remove_file(entry.path()).unwrap();
         }
-        refresh_entries(&mut fence, &dir);
+        assert!(refresh_entries(&mut fence, &dir));
         assert_eq!(fence.page, 0);
         assert_eq!(fence.top_row, 0.0);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_outgoing_move_stays_hidden_across_refreshes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "feather-fences-pending-outgoing-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("moving.txt");
+        std::fs::write(&path, b"item").unwrap();
+        let cfg = FenceCfg {
+            folder: Some(dir.clone()),
+            ..FenceCfg::default()
+        };
+        let mut fence = Fence::new(cfg, HWND::default());
+        let lease = fence.pending_outgoing.begin(path.clone());
+
+        assert!(!refresh_entries(&mut fence, &dir));
+        assert!(fence.entries.is_empty());
+        assert!(!refresh_entries(&mut fence, &dir));
+
+        drop(lease);
+        assert!(refresh_entries(&mut fence, &dir));
+        assert_eq!(fence.entries.len(), 1);
+        assert_eq!(fence.entries[0].path, path);
 
         std::fs::remove_dir_all(dir).unwrap();
     }

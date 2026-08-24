@@ -1,16 +1,22 @@
-
 // 栅栏生命周期:创建/删除/可见性 + 桌面图标避让编排 + Explorer 重启看门狗 + 拖放处理。
 use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows::Win32::System::Ole::RegisterDragDrop;
-use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GetWindow, GetWindowRect, GW_HWNDPREV, HWND_TOP, IsIconic, IsWindow,
-    IsWindowVisible, PostMessageW, SetWindowPos, ShowWindow, SW_HIDE, SW_SHOWNA, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+use windows::Win32::UI::Shell::{
+    SHCNE_CREATE, SHCNE_DELETE, SHCNE_MKDIR, SHCNE_RMDIR, SHCNF_FLUSHNOWAIT, SHCNF_PATHW,
+    SHChangeNotify,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    DestroyWindow, GW_HWNDPREV, GetWindow, GetWindowRect, IsIconic, IsWindowVisible, PostMessageW,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetWindowPos, ShowWindow,
+};
+use windows::core::{PCWSTR, w};
 
 use crate::config::{self, FenceCfg};
 use crate::desktop_icons;
@@ -21,7 +27,7 @@ use crate::perf;
 use crate::tray;
 use crate::utils::{self, wstr};
 use crate::watcher;
-use crate::{with_global, Global};
+use crate::{Global, with_global};
 
 use super::{ManagedWatcher, WatcherOwner};
 
@@ -39,8 +45,11 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     if cfg.pos_set != Some(true) && cfg.x == 0 && cfg.y == 0 {
         let (sw, sh) = utils::screen_size();
         let n = g.fences.len();
-        cfg.x = (sw - (320.0 * ms) as i32 - (20.0 * ms) as i32 - (n as i32 % 5) * (30.0 * ms) as i32).max(0);
-        cfg.y = ((80.0 * ms) as i32 + (n as i32 % 5) * (40.0 * ms) as i32).min((sh - (400.0 * ms) as i32).max(0));
+        cfg.x =
+            (sw - (320.0 * ms) as i32 - (20.0 * ms) as i32 - (n as i32 % 5) * (30.0 * ms) as i32)
+                .max(0);
+        cfg.y = ((80.0 * ms) as i32 + (n as i32 % 5) * (40.0 * ms) as i32)
+            .min((sh - (400.0 * ms) as i32).max(0));
     }
     // 恢复配置时先按保存 DPI 钳制;窗口创建后再按实际窗口 DPI 做最终换算。
     // 若这里使用系统 DPI,主屏 200% + 副屏 100% 会在创建副屏窗口前把尺寸错误放大。
@@ -63,11 +72,14 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     // 注册拖放
     let dt = droptarget::FenceDropTarget::new(hwnd);
     let it: windows::Win32::System::Ole::IDropTarget = dt.into();
-    unsafe { let _ = RegisterDragDrop(hwnd, &it); }
+    unsafe {
+        let _ = RegisterDragDrop(hwnd, &it);
+    }
     // 保持 COM 对象存活:塞进全局集合,进程退出时释放
     g.droptargets.push(it);
 
     let mut f = Fence::new(cfg, hwnd);
+    f.pending_outgoing = g.pending_outgoing.clone();
     // v3 持久化保留物理屏幕位置,仅按保存时 DPI → 当前窗口 DPI 换算尺寸。
     // 不能用系统 DPI 统一恢复:混合缩放多屏会把副屏窗口漂回主屏坐标。
     let saved_dpi = f.cfg.dpi;
@@ -78,10 +90,10 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     // 尺寸变化可能让跨屏窗口的主显示器切换;重新读取实际 DPI,最多再换算一次。
     for _ in 0..2 {
         f.dpi = current_dpi as f32 / 96.0;
-        let restored_w = config::scale_extent_for_dpi(saved_w, saved_dpi, current_dpi)
-            .max(fence::min_w(f.dpi));
-        let restored_h = config::scale_extent_for_dpi(saved_h, saved_dpi, current_dpi)
-            .max(fence::min_h(f.dpi));
+        let restored_w =
+            config::scale_extent_for_dpi(saved_w, saved_dpi, current_dpi).max(fence::min_w(f.dpi));
+        let restored_h =
+            config::scale_extent_for_dpi(saved_h, saved_dpi, current_dpi).max(fence::min_h(f.dpi));
         if restored_w != f.cfg.w || restored_h != f.cfg.h {
             unsafe {
                 let _ = SetWindowPos(
@@ -133,7 +145,9 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     // Win32 的实际 DPI 和窗口矩形为准,避免 cfg.dpi、f.dpi、w/h 互相矛盾。
     f.dpi = fence::window_dpi(hwnd);
     let mut final_rect = RECT::default();
-    unsafe { let _ = GetWindowRect(hwnd, &mut final_rect); }
+    unsafe {
+        let _ = GetWindowRect(hwnd, &mut final_rect);
+    }
     f.cfg.x = final_rect.left;
     f.cfg.y = final_rect.top;
     f.cfg.w = (final_rect.right - final_rect.left).max(1);
@@ -146,23 +160,21 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     // 目录监听(所有栅栏):文件夹栅栏监听门户目录,收纳栅栏监听收纳箱目录。
     // 通知按栅栏 id 发给消息窗口——不持有具体 hwnd,窗口被 Explorer 销毁重建后
     // watcher 无需重绑仍能按 id 找到新窗口;删除栅栏/重载时随 ManagedWatcher 停止。
-    let watch_dir = f.cfg.folder.clone().unwrap_or_else(|| config::vault_dir(&g.config));
+    let watch_dir = f
+        .cfg
+        .folder
+        .clone()
+        .unwrap_or_else(|| config::vault_dir(&g.config));
     let fid = id;
     let mhwnd = g.msg_hwnd.0 as usize;
+    let refresh_signal = f.refresh_signal.clone();
     g.fences.push(f);
     // 新栅栏立即落到网格:尺寸/位置吸附 + clamp 工作区 + 消除重叠
     let new_idx = g.fences.len() - 1;
     fence::settle_fence(g, new_idx);
 
     let watcher = watcher::spawn_dir_watcher(watch_dir, move |_names| {
-        unsafe {
-            let _ = PostMessageW(
-                Some(HWND(mhwnd as *mut c_void)),
-                fence::WM_APP_REFRESH_ID,
-                WPARAM(fid as usize),
-                LPARAM(0),
-            );
-        }
+        refresh_signal.post_by_id(HWND(mhwnd as *mut c_void), fid);
     });
     g.watchers.push(ManagedWatcher::fence(fid, watcher));
     sync_config(g);
@@ -189,19 +201,99 @@ pub(crate) fn sync_config(g: &mut Global) {
     config::save(&g.config);
 }
 
+fn place_visible_fences_in_desktop_layer(g: &mut Global) {
+    if g.zen {
+        return;
+    }
+
+    if perf::targetable_window() {
+        for f in g
+            .fences
+            .iter()
+            .filter(|f| f.valid && download_box_should_show(g, f.cfg.id))
+        {
+            unsafe {
+                if IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool() {
+                    let _ = SetWindowPos(
+                        f.hwnd,
+                        None,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                    if IsIconic(f.hwnd).as_bool() {
+                        let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    let host_valid = g.desktop_host.is_some_and(utils::is_current_desktop_host);
+    if !host_valid {
+        g.desktop_host = None;
+        g.desktop_host = utils::find_desktop_host();
+    }
+    let Some(host) = g.desktop_host else {
+        return;
+    };
+
+    let mut anchor = host;
+    for f in g
+        .fences
+        .iter()
+        .filter(|f| f.valid && download_box_should_show(g, f.cfg.id))
+    {
+        unsafe {
+            let Ok(above) = GetWindow(anchor, GW_HWNDPREV) else {
+                // Explorer may replace WorkerW between validation and placement. Never fall back
+                // to HWND_TOP: that is exactly the one-frame flash above the current app.
+                g.desktop_host = None;
+                return;
+            };
+            let needs_show = IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool();
+            let positioned = if above != f.hwnd || needs_show {
+                let common = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+                if above == f.hwnd {
+                    SetWindowPos(f.hwnd, None, 0, 0, 0, 0, common | SWP_NOZORDER).is_ok()
+                } else {
+                    SetWindowPos(f.hwnd, Some(above), 0, 0, 0, 0, common).is_ok()
+                }
+            } else {
+                true
+            };
+            if !positioned {
+                if needs_show {
+                    let _ = ShowWindow(f.hwnd, SW_HIDE);
+                }
+                g.desktop_host = None;
+                return;
+            }
+            if IsIconic(f.hwnd).as_bool() {
+                let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
+        anchor = f.hwnd;
+    }
+}
+
 pub(crate) fn apply_visibility(g: &mut Global) {
     for f in &g.fences {
         if !f.valid {
             continue;
         }
-        unsafe {
-            if g.zen || !download_box_should_show(g, f.cfg.id) {
-                let _ = ShowWindow(f.hwnd, SW_HIDE);
-            } else {
-                let _ = ShowWindow(f.hwnd, SW_SHOWNA);
+        if g.zen || !download_box_should_show(g, f.cfg.id) {
+            unsafe {
+                if IsWindowVisible(f.hwnd).as_bool() {
+                    let _ = ShowWindow(f.hwnd, SW_HIDE);
+                }
             }
         }
     }
+    place_visible_fences_in_desktop_layer(g);
 }
 
 pub(crate) fn reserve_desktop_icons(g: &Global) {
@@ -246,20 +338,9 @@ pub(crate) fn rollback_desktop(g: &mut Global) {
 pub(crate) fn watchdog_tick(g: &mut Global) {
     // 窗口已独立于桌面层(不挂 Progman),无需宿主检测;
     // 之前 EnumWindows + SendMessageW(0x052C) 在 Progman 无响应时会卡死主线程
-    let download_id = g.config.download_box_id;
-    let download_shown = g.config.download_enabled && g.config.download_box_visible;
     for f in g.fences.iter_mut() {
-        let intentionally_hidden = download_id == Some(f.cfg.id) && !download_shown;
-        if f.valid && !g.zen && !intentionally_hidden {
-            let hidden_or_minimized = unsafe {
-                IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool()
-            };
-            if hidden_or_minimized {
-                unsafe { let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE); }
-                fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
-            }
-        }
         if !f.valid {
+            f.refresh_signal.cancel();
             // 窗口被 Explorer 销毁,重建
             let cfg = f.cfg.clone();
             // 不挂 Progman(分层窗口+高 alpha+Progman 父窗口会触发 DWM 命中测试 bug,
@@ -268,36 +349,17 @@ pub(crate) fn watchdog_tick(g: &mut Global) {
             if !hwnd.is_invalid() {
                 let dt = droptarget::FenceDropTarget::new(hwnd);
                 let it: windows::Win32::System::Ole::IDropTarget = dt.into();
-                unsafe { let _ = RegisterDragDrop(hwnd, &it); }
+                unsafe {
+                    let _ = RegisterDragDrop(hwnd, &it);
+                }
                 g.droptargets.push(it);
                 f.hwnd = hwnd;
                 f.valid = true;
                 f.moving = false;
                 f.resizing = None;
-                if g.zen {
-                    unsafe { let _ = ShowWindow(hwnd, SW_HIDE); };
-                }
                 // watcher 仍挂在 f 上且按栅栏 id 通知,新窗口自动恢复实时刷新
                 fence::refresh_entries(f, &config::vault_dir(&g.config));
                 fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
-            }
-        }
-        // 周期回位:任何原因把栅栏从桌面层顶起时,3s 内插回桌面层之上。
-        // 用 desktop_insert_host(Progman 之后)而非 HWND_BOTTOM ——
-        // HWND_BOTTOM 会把窗口压进 Progman 之下的 DWM 隐藏区域(不可见)。
-        if f.valid {
-            if let Some(host) = utils::desktop_insert_host() {
-                unsafe {
-                    let _ = SetWindowPos(
-                        f.hwnd,
-                        Some(host),
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
-                }
             }
         }
     }
@@ -308,57 +370,140 @@ pub(crate) fn watchdog_tick(g: &mut Global) {
 /// 维护严格的“所有应用窗口 > 栅栏 > Explorer 桌面”层级。
 /// 栅栏永不使用 TOPMOST；Show Desktop 改写 Z 序后，也只把它插回桌面宿主正上方。
 pub(crate) fn desktop_layer_tick(g: &mut Global) {
-    if g.zen {
-        return;
-    }
-    if perf::targetable_window() {
-        // Show Desktop may minimize the profiling-only normal window. Restore it for the safe UI
-        // driver, but leave its Z order alone so the desktop remains the drop target underneath.
-        for f in g
-            .fences
-            .iter()
-            .filter(|f| f.valid && download_box_should_show(g, f.cfg.id))
-        {
-            unsafe {
-                if IsIconic(f.hwnd).as_bool() {
-                    let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
-                }
-            }
-        }
-        return;
-    }
-    let host_valid = g.desktop_host.is_some_and(|h| unsafe { IsWindow(Some(h)).as_bool() });
-    if !host_valid {
-        g.desktop_host = utils::find_desktop_host();
-    }
-    let Some(host) = g.desktop_host else { return };
-    let mut anchor = host;
-    for f in g
-        .fences
-        .iter()
-        .filter(|f| f.valid && download_box_should_show(g, f.cfg.id))
-    {
-        unsafe {
-            if IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool() {
-                let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
-            }
-            let above = GetWindow(anchor, GW_HWNDPREV).unwrap_or(HWND_TOP);
-            if above != f.hwnd {
-                let _ = SetWindowPos(
-                    f.hwnd,
-                    Some(above),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
-        }
-        anchor = f.hwnd;
-    }
+    place_visible_fences_in_desktop_layer(g);
 }
 // ---------- 拖放处理 ----------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellChangeKind {
+    MoveFile,
+    MoveFolder,
+    CopyFile,
+    CopyFolder,
+}
+
+impl ShellChangeKind {
+    fn from_operation(copy_requested: bool, is_dir: bool) -> Self {
+        match (copy_requested, is_dir) {
+            (false, false) => Self::MoveFile,
+            (false, true) => Self::MoveFolder,
+            (true, false) => Self::CopyFile,
+            (true, true) => Self::CopyFolder,
+        }
+    }
+}
+
+struct CompletedShellChange {
+    kind: ShellChangeKind,
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+/// A completed same-volume desktop move whose Explorer notification is deliberately deferred.
+/// The transfer worker uses that short gap to submit the captured icon coordinate first.
+#[must_use = "a completed desktop move must be published to Explorer"]
+pub(crate) struct DesktopMoveCompletion {
+    change: CompletedShellChange,
+}
+
+/// Raw filesystem operations do not emit the optimized-move notifications that Shell file APIs
+/// normally provide. Notify Explorer after leaving the global UI-state lock. FLUSHNOWAIT delivers
+/// promptly without synchronously waiting for every Shell recipient.
+fn notify_shell_change(change: &CompletedShellChange) {
+    let source_w: Vec<u16> = change
+        .source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let destination_w: Vec<u16> = change
+        .destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let flags = SHCNF_PATHW | SHCNF_FLUSHNOWAIT;
+    unsafe {
+        match change.kind {
+            // These operations always cross directories (same-directory drops are skipped).
+            // To Shell views this is a removal from the source folder plus a creation in the
+            // destination folder, not a same-folder rename. Reporting RENAMEITEM/RENAMEFOLDER
+            // leaves virtual Desktop views stale until their normal directory polling catches up.
+            ShellChangeKind::MoveFile => {
+                SHChangeNotify(
+                    SHCNE_DELETE,
+                    flags,
+                    Some(source_w.as_ptr() as *const c_void),
+                    None,
+                );
+                SHChangeNotify(
+                    SHCNE_CREATE,
+                    flags,
+                    Some(destination_w.as_ptr() as *const c_void),
+                    None,
+                );
+            }
+            ShellChangeKind::MoveFolder => {
+                SHChangeNotify(
+                    SHCNE_RMDIR,
+                    flags,
+                    Some(source_w.as_ptr() as *const c_void),
+                    None,
+                );
+                SHChangeNotify(
+                    SHCNE_MKDIR,
+                    flags,
+                    Some(destination_w.as_ptr() as *const c_void),
+                    None,
+                );
+            }
+            ShellChangeKind::CopyFile => SHChangeNotify(
+                SHCNE_CREATE,
+                flags,
+                Some(destination_w.as_ptr() as *const c_void),
+                None,
+            ),
+            ShellChangeKind::CopyFolder => SHChangeNotify(
+                SHCNE_MKDIR,
+                flags,
+                Some(destination_w.as_ptr() as *const c_void),
+                None,
+            ),
+        }
+    }
+}
+
+/// Transfer one item outside the UI lock without publishing the Shell view notification yet.
+/// Used by the desktop fast path so it can position the new icon before Explorer is prompted to
+/// paint the filesystem change. This remains an exact, same-volume, no-replace move.
+pub(crate) fn move_item_to_desktop_unpublished(
+    source: &Path,
+    target: &Path,
+) -> Result<DesktopMoveCompletion, String> {
+    if !source.exists() {
+        return Err("源项目不存在或已被移动".to_string());
+    }
+    let metadata = std::fs::symlink_metadata(source).map_err(|error| error.to_string())?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err("source changed to a reparse point during the drag".to_string());
+    }
+    let is_dir = source.is_dir();
+    let destination = watcher::move_to_dir_atomic_no_replace(source, target)?;
+    Ok(DesktopMoveCompletion {
+        change: CompletedShellChange {
+            kind: ShellChangeKind::from_operation(false, is_dir),
+            source: source.to_path_buf(),
+            destination,
+        },
+    })
+}
+
+/// Publish a completed desktop move exactly once after its icon coordinate has been submitted.
+/// Consuming the token prevents accidental duplicate CREATE/DELETE notifications.
+pub(crate) fn publish_desktop_move(completion: DesktopMoveCompletion) -> PathBuf {
+    notify_shell_change(&completion.change);
+    completion.change.destination
+}
 
 fn format_drop_failures(
     target: &Path,
@@ -385,7 +530,10 @@ fn format_drop_failures(
         message.push_str(&format!("• {name}：{error}\n"));
     }
     if failures.len() > MAX_DETAILS {
-        message.push_str(&format!("• 另有 {} 个项目未列出\n", failures.len() - MAX_DETAILS));
+        message.push_str(&format!(
+            "• 另有 {} 个项目未列出\n",
+            failures.len() - MAX_DETAILS
+        ));
     }
     message.push_str("\n请检查原位置和目标目录后重试。程序不会主动删除未成功移动的源项目。");
     message
@@ -424,13 +572,14 @@ pub(crate) fn handle_drop(
                     .map(|path| (path.clone(), "无法创建或访问栅栏存储目录".to_string()))
                     .collect();
                 resolve_elapsed = resolve_started.map(|started| started.elapsed());
-                return Some((vault, 0, failures));
+                return Some((vault, 0, failures, Vec::new()));
             }
             vault
         };
         resolve_elapsed = resolve_started.map(|started| started.elapsed());
         let mut succeeded = 0usize;
         let mut failures = Vec::new();
+        let mut shell_changes = Vec::new();
         let operations_started = trace.stage_start();
         for p in &paths {
             let src = PathBuf::from(p);
@@ -440,12 +589,11 @@ pub(crate) fn handle_drop(
                 continue;
             }
             // MOVE 到自身目录没有意义；COPY 到自身目录则应生成一个重名副本。
-            if !copy_requested
-                && src.parent().map(|d| d == target.as_path()).unwrap_or(false)
-            {
+            if !copy_requested && src.parent().map(|d| d == target.as_path()).unwrap_or(false) {
                 same_dir_skipped += 1;
                 continue;
             }
+            let is_dir = src.is_dir();
             let item_started = trace.stage_start();
             let operation = if copy_requested {
                 watcher::copy_to_dir(&src, &target)
@@ -460,7 +608,14 @@ pub(crate) fn handle_drop(
                 );
             }
             match operation {
-                Ok(_) => succeeded += 1,
+                Ok(destination) => {
+                    succeeded += 1;
+                    shell_changes.push(CompletedShellChange {
+                        kind: ShellChangeKind::from_operation(copy_requested, is_dir),
+                        source: src,
+                        destination,
+                    });
+                }
                 Err(e) => {
                     let name = if copy_requested { "copy" } else { "move" };
                     eprintln!("[feather] {name} {p} -> {} failed: {e}", target.display());
@@ -497,18 +652,19 @@ pub(crate) fn handle_drop(
             );
             notify_elapsed = notify_started.map(|started| started.elapsed());
         }
-        Some((target, succeeded, failures))
+        Some((target, succeeded, failures, shell_changes))
     });
 
     if let Some(started) = global_started {
         trace.record_stage("drop_global_total", started.elapsed(), || {
-            format!("scope=aggregate fence={fence_id} found={}", result.is_some())
+            format!(
+                "scope=aggregate fence={fence_id} found={}",
+                result.is_some()
+            )
         });
     }
     if let Some(elapsed) = resolve_elapsed {
-        trace.record_stage("resolve_target", elapsed, || {
-            format!("fence={fence_id}")
-        });
+        trace.record_stage("resolve_target", elapsed, || format!("fence={fence_id}"));
     }
     if let Some(elapsed) = file_ops_elapsed {
         trace.record_stage("file_operations", elapsed, || {
@@ -522,12 +678,10 @@ pub(crate) fn handle_drop(
         });
     }
     if let Some(elapsed) = notify_elapsed {
-        trace.record_stage("drop_notification", elapsed, || {
-            format!("fence={fence_id}")
-        });
+        trace.record_stage("drop_notification", elapsed, || format!("fence={fence_id}"));
     }
 
-    let Some((target, succeeded, failures)) = result else {
+    let Some((target, succeeded, failures, shell_changes)) = result else {
         trace.event("file_result", || {
             format!("fence=0 items={item_count} succeeded=0 failed=0 reason=fence_missing")
         });
@@ -542,6 +696,13 @@ pub(crate) fn handle_drop(
     if succeeded > 0 && !post_ok {
         trace.event("refresh_post_failed", || format!("fence={fence_id}"));
     }
+    let shell_notify_started = trace.stage_start();
+    for change in &shell_changes {
+        notify_shell_change(change);
+    }
+    trace.finish_stage("shell_change_notify", shell_notify_started, || {
+        format!("scope=exclusive items={}", shell_changes.len())
+    });
     if !failures.is_empty() {
         let message = format_drop_failures(&target, succeeded, &failures, copy_requested);
         let message_w = wstr(&message);
@@ -562,7 +723,7 @@ pub(crate) fn handle_drop(
 }
 #[cfg(test)]
 mod drop_feedback_tests {
-    use super::format_drop_failures;
+    use super::{ShellChangeKind, format_drop_failures};
     use std::path::Path;
 
     #[test]
@@ -579,4 +740,25 @@ mod drop_feedback_tests {
         assert!(!message.contains("file-5.txt"));
         assert!(message.contains("另有 2 个项目未列出"));
     }
+
+    #[test]
+    fn shell_change_kind_matches_copy_move_and_item_type() {
+        assert_eq!(
+            ShellChangeKind::from_operation(false, false),
+            ShellChangeKind::MoveFile
+        );
+        assert_eq!(
+            ShellChangeKind::from_operation(false, true),
+            ShellChangeKind::MoveFolder
+        );
+        assert_eq!(
+            ShellChangeKind::from_operation(true, false),
+            ShellChangeKind::CopyFile
+        );
+        assert_eq!(
+            ShellChangeKind::from_operation(true, true),
+            ShellChangeKind::CopyFolder
+        );
+    }
+
 }

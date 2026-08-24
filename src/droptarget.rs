@@ -1,20 +1,25 @@
 // 文件拖放:IDropTarget 实现,拖文件进栅栏 → 移动到栅栏目录/收纳箱
 use std::cell::Cell;
 use std::ffi::c_void;
+use std::mem::size_of;
 
-use windows::core::{implement, Ref, Result, w};
-use windows::Win32::Foundation::{HWND, MAX_PATH, POINTL};
-use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL};
+use windows::Win32::Foundation::{GlobalFree, HWND, MAX_PATH, POINTL};
+use windows::Win32::System::Com::{
+    DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, TYMED_HGLOBAL,
+};
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows::Win32::System::Ole::ReleaseStgMedium;
+use windows::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_HDROP;
+use windows::Win32::System::Ole::ReleaseStgMedium;
 use windows::Win32::System::Ole::{
     DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl,
 };
 use windows::Win32::System::SystemServices::{MK_CONTROL, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-use windows::Win32::UI::Shell::{DragQueryFileW, ILCombine, ILFree, SHGetPathFromIDListW, HDROP};
+use windows::Win32::UI::Shell::{
+    CFSTR_PERFORMEDDROPEFFECT, DragQueryFileW, HDROP, ILCombine, ILFree, SHGetPathFromIDListW,
+};
+use windows::core::{Ref, Result, implement, w};
 
 #[implement(IDropTarget)]
 pub struct FenceDropTarget {
@@ -40,6 +45,76 @@ fn hdrop_format() -> FORMATETC {
         dwAspect: DVASPECT_CONTENT.0 as u32,
         lindex: -1,
         tymed: TYMED_HGLOBAL.0 as u32,
+    }
+}
+
+fn performed_drop_effect_format() -> FORMATETC {
+    FORMATETC {
+        cfFormat: unsafe { RegisterClipboardFormatW(CFSTR_PERFORMEDDROPEFFECT) as u16 },
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0 as u32,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    }
+}
+
+/// Report the operation actually completed by this target. A successful `SetData(..., true)`
+/// transfers ownership of the HGLOBAL to the source data object; on failure it remains ours.
+fn report_performed_drop_effect(dataobj: Option<&IDataObject>, effect: DROPEFFECT) -> bool {
+    let Some(dataobj) = dataobj else {
+        return false;
+    };
+    unsafe {
+        let Ok(hglobal) = GlobalAlloc(GHND, size_of::<u32>()) else {
+            return false;
+        };
+        let ptr = GlobalLock(hglobal);
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(hglobal));
+            return false;
+        }
+        std::ptr::write_unaligned(ptr as *mut u32, effect.0);
+        let _ = GlobalUnlock(hglobal);
+
+        let mut medium = STGMEDIUM::default();
+        medium.tymed = TYMED_HGLOBAL.0 as u32;
+        medium.u.hGlobal = hglobal;
+        let result = dataobj.SetData(&performed_drop_effect_format(), &medium, true);
+        if result.is_err() {
+            ReleaseStgMedium(&mut medium);
+        }
+        result.is_ok()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DropReport {
+    ole_effect: DROPEFFECT,
+    performed_effect: Option<DROPEFFECT>,
+}
+
+/// The target physically moves source files itself, so a completed MOVE must use the Shell's
+/// optimized-move report: a non-MOVE OLE result plus an explicit performed NONE.
+fn completed_drop_report(selected: DROPEFFECT, allowed: DROPEFFECT, handled: bool) -> DropReport {
+    if !handled || selected == DROPEFFECT_NONE {
+        return DropReport {
+            ole_effect: DROPEFFECT_NONE,
+            performed_effect: None,
+        };
+    }
+    if selected == DROPEFFECT_COPY {
+        return DropReport {
+            ole_effect: DROPEFFECT_COPY,
+            performed_effect: Some(DROPEFFECT_COPY),
+        };
+    }
+    DropReport {
+        ole_effect: if allowed.0 & DROPEFFECT_COPY.0 != 0 {
+            DROPEFFECT_COPY
+        } else {
+            DROPEFFECT_NONE
+        },
+        performed_effect: Some(DROPEFFECT_NONE),
     }
 }
 
@@ -260,6 +335,17 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
             }
             let allowed_effect = *pdweffect;
             let selected = pick_effect(*pdweffect, keys);
+            if selected == DROPEFFECT_NONE {
+                *pdweffect = DROPEFFECT_NONE;
+                trace.finish_stage("drop_callback_total", callback_started, || {
+                    format!(
+                        "scope=aggregate items={} accepted=false reason=no_effect",
+                        paths.len()
+                    )
+                });
+                trace.finish("rejected", || "reason=no_allowed_effect".to_string());
+                return Ok(());
+            }
             let copy_requested = selected == DROPEFFECT_COPY;
             let item_count = paths.len();
             trace.event("effect_selected", || {
@@ -275,15 +361,17 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
             trace.finish_stage("drop_handler_total", handler_started, || {
                 format!("scope=aggregate items={item_count} accepted={handled}")
             });
-            *pdweffect = if handled {
-                selected
-            } else {
-                DROPEFFECT_NONE
-            };
+            let report = completed_drop_report(selected, allowed_effect, handled);
+            let feedback_ok = report
+                .performed_effect
+                .map(|effect| report_performed_drop_effect(dataobj.as_ref(), effect));
+            *pdweffect = report.ole_effect;
             trace.finish_stage("drop_callback_total", callback_started, || {
                 format!(
-                    "scope=aggregate items={item_count} copy={copy_requested} accepted={handled} final_bits={}",
-                    (*pdweffect).0
+                    "scope=aggregate items={item_count} copy={copy_requested} accepted={handled} final_bits={} performed_bits={} feedback_ok={}",
+                    (*pdweffect).0,
+                    report.performed_effect.map(|effect| effect.0).unwrap_or(u32::MAX),
+                    feedback_ok.map(|ok| ok.to_string()).unwrap_or_else(|| "not_sent".to_string())
                 )
             });
             if handled {
@@ -327,6 +415,46 @@ mod effect_tests {
         assert_eq!(
             pick_effect(DROPEFFECT_COPY, MODIFIERKEYS_FLAGS::default()),
             DROPEFFECT_COPY
+        );
+    }
+
+    #[test]
+    fn completed_copy_reports_copy_and_keeps_the_source() {
+        assert_eq!(
+            completed_drop_report(DROPEFFECT_COPY, DROPEFFECT_COPY | DROPEFFECT_MOVE, true),
+            DropReport {
+                ole_effect: DROPEFFECT_COPY,
+                performed_effect: Some(DROPEFFECT_COPY),
+            }
+        );
+    }
+
+    #[test]
+    fn completed_move_never_asks_the_source_to_delete_again() {
+        assert_eq!(
+            completed_drop_report(DROPEFFECT_MOVE, DROPEFFECT_COPY | DROPEFFECT_MOVE, true),
+            DropReport {
+                ole_effect: DROPEFFECT_COPY,
+                performed_effect: Some(DROPEFFECT_NONE),
+            }
+        );
+        assert_eq!(
+            completed_drop_report(DROPEFFECT_MOVE, DROPEFFECT_MOVE, true),
+            DropReport {
+                ole_effect: DROPEFFECT_NONE,
+                performed_effect: Some(DROPEFFECT_NONE),
+            }
+        );
+    }
+
+    #[test]
+    fn failed_drop_does_not_report_success() {
+        assert_eq!(
+            completed_drop_report(DROPEFFECT_MOVE, DROPEFFECT_COPY | DROPEFFECT_MOVE, false),
+            DropReport {
+                ole_effect: DROPEFFECT_NONE,
+                performed_effect: None,
+            }
         );
     }
 }

@@ -2,51 +2,47 @@
 use std::mem::size_of;
 use std::path::PathBuf;
 
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::System::SystemServices::MK_LBUTTON;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TrackMouseEvent, VK_DELETE, TME_LEAVE,
-    TRACKMOUSEEVENT, TRACKMOUSEEVENT_FLAGS,
+    ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
+    TRACKMOUSEEVENT_FLAGS, TrackMouseEvent, VK_DELETE,
 };
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, SHFileOperationW, SHFILEOPSTRUCTW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
-    FOF_NOERRORUI, FO_DELETE,
+    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, SHFILEOPSTRUCTW, SHFileOperationW,
+    ShellExecuteW,
 };
-use windows::Win32::System::SystemServices::MK_LBUTTON;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetCursorPos, GetSystemMetrics, GetWindowRect, LoadCursorW,
-    PostMessageW, RegisterClassW, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow,
-    CS_DBLCLKS, HTCLIENT, IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
-    IDC_SIZEALL, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SC_MINIMIZE, SIZE_MINIMIZED,
-    SW_HIDE, WNDCLASSW,
-    WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
-    WM_SYSCOMMAND, WM_TIMER, WM_DISPLAYCHANGE, WM_DPICHANGED, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_POPUP,
+    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, GetCursorPos, GetSystemMetrics, GetWindowRect,
+    HTCLIENT, IDC_ARROW, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IsIconic,
+    IsWindowVisible, LoadCursorW, PostMessageW, RegisterClassW, SC_MINIMIZE, SIZE_MINIMIZED,
+    SM_CXDRAG, SM_CYDRAG, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_NOZORDER, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, WM_CANCELMODE,
+    WM_CAPTURECHANGED, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSCOMMAND, WM_TIMER, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
 };
+use windows::core::{PCWSTR, w};
 
-use crate::config::{scale_extent_for_dpi, FenceCfg};
+use crate::config::{FenceCfg, scale_extent_for_dpi};
 use crate::utils::{work_area, wstr};
-use crate::{with_global, Global};
+use crate::{Global, with_global};
 
-use super::geometry::{
-    cell_h, cell_w, margin, min_h, min_w, rail, title_h, window_dpi,
-};
+use super::geometry::{cell_h, cell_w, margin, min_h, min_w, rail, title_h, window_dpi};
 use super::grid::{
-    config_snapshot, grid_dims, hit_item, magnet_size_smooth, magnet_smooth, resize_dir_at,
-    settle_fence, start_page_anim, step_page_anim, sync_page, total_pages, ANIM_TICK,
+    ANIM_TICK, config_snapshot, grid_dims, hit_item, magnet_size_smooth, magnet_smooth,
+    resize_dir_at, settle_fence, start_page_anim, step_page_anim, sync_page, total_pages,
 };
 use super::menu::{fence_menu, rename_fence};
 use super::refresh::{
-    refresh_entries, refresh_fence_now, refresh_fence_now_timed, restart_refresh_timer,
-    stop_refresh_timer, REFRESH_DEBOUNCE_MS, REFRESH_TICK,
+    REFRESH_TICK, refresh_entries, refresh_fence_now, refresh_fence_now_timed,
+    restart_refresh_timer, stop_refresh_timer,
 };
 use super::render::{continue_perf_animation, render_fence};
 use super::{RefreshTimerAction, ResizeDir, WM_APP_DESKTOP_RESTORE, WM_APP_DROP, WM_APP_REFRESH};
@@ -94,7 +90,7 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
         let r = CreateWindowExW(
             // 分层窗口 + ULW 整幅提交:逐像素 alpha,半透明面板真透明透出桌面。
             // 圆角由 DWM 裁(DWMWCP_ROUND 对分层窗口同样生效)。
-            // 启动时用 SW_SHOWNA 避免抢焦点；用户点击后允许激活，才能接收 Delete。
+            // 窗口保持隐藏，生命周期层完成布局和桌面 Z 序后再一次性显示。
             ex_style,
             w!("FeatherFence"),
             PCWSTR(title_w.as_ptr()),
@@ -116,34 +112,18 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
             }
         };
         if !hwnd.is_invalid() {
-            // 插到桌面层之上(Progman 之后):栅栏位于桌面背景之上、图标层/普通窗口之下。
-            // 不用 HWND_BOTTOM:实测会把窗口压到 Progman 之下的 DWM 隐藏区域,
-            // 窗口不可见且 FindWindow/EnumWindows 都枚举不到。
-            // 不挂 Progman 作父窗口(分层窗口+高 alpha+Progman 父窗口会触发 DWM
-            // 命中测试 bug,导致窗口可见但点不到拖不动)。
-            if let Some(host) = crate::utils::desktop_insert_host() {
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(host),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
-            // 分层窗口:显示后整幅 ULW 提交(逐像素 alpha,透明面板透出桌面)。
-            let _ = ShowWindow(hwnd, SW_SHOWNA);
             // 圆角由 DWM 裁
             enable_round(hwnd);
-            // 首帧渲染(画进缓存 + ULW 提交)
-            schedule_render(hwnd);
+            // Keep the layered top-level window hidden until DPI, content, grid placement and
+            // desktop Z order have reached their final state. It will be revealed atomically by
+            // the lifecycle layer after the Fence has been added to Global.
             // 自检:程序自己测命中(对比外部诊断,区分桌面/进程视角问题)
             let mut rc = RECT::default();
             let _ = GetWindowRect(hwnd, &mut rc);
             let cx = (rc.left + rc.right) / 2;
             let cy = (rc.top + rc.bottom) / 2;
-            let _hit = windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT { x: cx, y: cy });
+            let _hit =
+                windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT { x: cx, y: cy });
             crate::dlog(&format!(
                 "[feather] created hwnd=0x{:x} at ({},{},{},{})",
                 hwnd.0 as usize, rc.left, rc.top, rc.right, rc.bottom
@@ -241,7 +221,10 @@ fn recycle_path(hwnd: HWND, path: &std::path::Path) -> Result<(), String> {
     if code == 0 && !op.fAnyOperationsAborted.as_bool() {
         Ok(())
     } else {
-        Err(format!("SHFileOperationW code={code}, aborted={}", op.fAnyOperationsAborted.as_bool()))
+        Err(format!(
+            "SHFileOperationW code={code}, aborted={}",
+            op.fAnyOperationsAborted.as_bool()
+        ))
     }
 }
 unsafe extern "system" fn fence_wndproc(
@@ -264,9 +247,20 @@ unsafe extern "system" fn fence_wndproc(
             return LRESULT(0);
         }
         WM_APP_DESKTOP_RESTORE => {
-            let should_show = with_global(|g| !g.zen && fence_idx(g, hwnd).is_some());
-            if should_show {
-                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            // Win+D can minimize/reorder independent top-level windows. Restore through the same
+            // visibility + desktop-layer path used at startup; a direct ShowWindow here can expose
+            // a disabled download fence or briefly put a fence above the current application.
+            let should_render = with_global(|g| {
+                let Some(idx) = fence_idx(g, hwnd) else {
+                    return false;
+                };
+                crate::fencelife::apply_visibility(g);
+                unsafe {
+                    IsWindowVisible(g.fences[idx].hwnd).as_bool()
+                        && !IsIconic(g.fences[idx].hwnd).as_bool()
+                }
+            });
+            if should_render {
                 schedule_render(hwnd);
             }
             return LRESULT(0);
@@ -295,6 +289,8 @@ unsafe extern "system" fn fence_wndproc(
         WM_DESTROY => {
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
+                    g.fences[idx].refresh_signal.cancel();
+                    stop_refresh_timer(hwnd);
                     g.fences[idx].valid = false;
                 }
             });
@@ -303,10 +299,18 @@ unsafe extern "system" fn fence_wndproc(
         WM_APP_REFRESH => {
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
-                    // 后续事件只更新时间戳，不再投递消息；计时器到期时检查安静期。
-                    if !restart_refresh_timer(hwnd, REFRESH_DEBOUNCE_MS) {
-                        g.fences[idx].refresh_signal.cancel();
-                        refresh_fence_now(g, idx);
+                    match g.fences[idx].refresh_signal.timer_action() {
+                        RefreshTimerAction::Idle => stop_refresh_timer(hwnd),
+                        RefreshTimerAction::Wait(delay_ms) => {
+                            if !restart_refresh_timer(hwnd, delay_ms) {
+                                g.fences[idx].refresh_signal.cancel();
+                                refresh_fence_now(g, idx);
+                            }
+                        }
+                        RefreshTimerAction::Refresh => {
+                            stop_refresh_timer(hwnd);
+                            refresh_fence_now(g, idx);
+                        }
                     }
                 }
             });
@@ -333,20 +337,14 @@ unsafe extern "system" fn fence_wndproc(
             });
             if let Some((fence_id, (scan_elapsed, render_elapsed))) = refreshed {
                 if let Some(elapsed) = scan_elapsed {
-                    crate::perf::record_drop_stage(
-                        operation_id,
-                        "fence_scan",
-                        elapsed,
-                        || format!("scope=exclusive fence={fence_id}"),
-                    );
+                    crate::perf::record_drop_stage(operation_id, "fence_scan", elapsed, || {
+                        format!("scope=exclusive fence={fence_id}")
+                    });
                 }
                 if let Some(elapsed) = render_elapsed {
-                    crate::perf::record_drop_stage(
-                        operation_id,
-                        "fence_render",
-                        elapsed,
-                        || format!("scope=exclusive fence={fence_id}"),
-                    );
+                    crate::perf::record_drop_stage(operation_id, "fence_render", elapsed, || {
+                        format!("scope=exclusive fence={fence_id}")
+                    });
                 }
                 if let Some(started) = refresh_total_started {
                     crate::perf::record_drop_stage(
@@ -356,11 +354,9 @@ unsafe extern "system" fn fence_wndproc(
                         || format!("scope=aggregate fence={fence_id} found=true"),
                     );
                 }
-                crate::perf::record_drop_event(
-                    operation_id,
-                    "visible_refresh_complete",
-                    || format!("fence={fence_id} found=true"),
-                );
+                crate::perf::record_drop_event(operation_id, "visible_refresh_complete", || {
+                    format!("fence={fence_id} found=true")
+                });
             } else if let Some(started) = refresh_total_started {
                 crate::perf::record_drop_stage(
                     operation_id,
@@ -368,11 +364,9 @@ unsafe extern "system" fn fence_wndproc(
                     started.elapsed(),
                     || "scope=aggregate fence=0 found=false".to_string(),
                 );
-                crate::perf::record_drop_event(
-                    operation_id,
-                    "visible_refresh_complete",
-                    || "fence=0 found=false".to_string(),
-                );
+                crate::perf::record_drop_event(operation_id, "visible_refresh_complete", || {
+                    "fence=0 found=false".to_string()
+                });
             }
             return LRESULT(0);
         }
@@ -380,7 +374,9 @@ unsafe extern "system" fn fence_wndproc(
             let path = with_global(|g| {
                 let idx = fence_idx(g, hwnd)?;
                 let f = &g.fences[idx];
-                f.selected.and_then(|i| f.entries.get(i)).map(|e| e.path.clone())
+                f.selected
+                    .and_then(|i| f.entries.get(i))
+                    .map(|e| e.path.clone())
             });
             if let Some(path) = path {
                 match recycle_path(hwnd, &path) {
@@ -435,10 +431,19 @@ unsafe extern "system" fn fence_wndproc(
             }
             // 达到拖拽阈值后要启动的拖出(路径 + 目标目录),在 with_global 之外执行。
             // 复制/移动由 OLE 目标根据拖动过程中的实时按键决定。
-            let mut drag_path: Option<(String, PathBuf, HWND, crate::perf::DropTrace)> = None;
+            let mut drag_path: Option<(
+                PathBuf,
+                PathBuf,
+                HWND,
+                u32,
+                super::RefreshSignal,
+                super::PendingOutgoing,
+                crate::perf::DropTrace,
+            )> = None;
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
                     let ghost = g.config.ghost_mode;
+                    let pending_outgoing = g.pending_outgoing.clone();
                     let mut need_render = false;
                     {
                         let f = &mut g.fences[idx];
@@ -460,8 +465,18 @@ unsafe extern "system" fn fence_wndproc(
                             // 连续磁吸:平滑拉向最近格点,越近拉得越紧(无瞬移跳变);
                             // 同时 clamp 进工作区,防拖出屏幕
                             let wa = work_area(hwnd);
-                            let rx = magnet_smooth((cur.x - f.move_off.0) as f32, cell_w(f), wa.left, 0.5);
-                            let ry = magnet_smooth((cur.y - f.move_off.1) as f32, cell_h(f), wa.top, 0.5);
+                            let rx = magnet_smooth(
+                                (cur.x - f.move_off.0) as f32,
+                                cell_w(f),
+                                wa.left,
+                                0.5,
+                            );
+                            let ry = magnet_smooth(
+                                (cur.y - f.move_off.1) as f32,
+                                cell_h(f),
+                                wa.top,
+                                0.5,
+                            );
                             let mut nx = rx.round() as i32;
                             let mut ny = ry.round() as i32;
                             nx = nx.clamp(wa.left, (wa.right - f.cfg.w).max(wa.left));
@@ -486,10 +501,17 @@ unsafe extern "system" fn fence_wndproc(
                             let _ = GetCursorPos(&mut cur);
                             let mut rc = RECT::default();
                             let _ = GetWindowRect(hwnd, &mut rc);
-                            let (mut nx, mut ny, mut nw, mut nh) = (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
-                            let apply = |nx: &mut i32, ny: &mut i32, nw: &mut i32, nh: &mut i32, dir: ResizeDir| {
+                            let (mut nx, mut ny, mut nw, mut nh) =
+                                (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+                            let apply = |nx: &mut i32,
+                                         ny: &mut i32,
+                                         nw: &mut i32,
+                                         nh: &mut i32,
+                                         dir: ResizeDir| {
                                 match dir {
-                                    ResizeDir::E | ResizeDir::NE | ResizeDir::SE => *nw = (cur.x - *nx).max(min_w(d)),
+                                    ResizeDir::E | ResizeDir::NE | ResizeDir::SE => {
+                                        *nw = (cur.x - *nx).max(min_w(d))
+                                    }
                                     ResizeDir::W | ResizeDir::NW | ResizeDir::SW => {
                                         let right = *nx + *nw;
                                         *nx = cur.x.min(right - min_w(d));
@@ -498,7 +520,9 @@ unsafe extern "system" fn fence_wndproc(
                                     _ => {}
                                 }
                                 match dir {
-                                    ResizeDir::S | ResizeDir::SE | ResizeDir::SW => *nh = (cur.y - *ny).max(min_h(d)),
+                                    ResizeDir::S | ResizeDir::SE | ResizeDir::SW => {
+                                        *nh = (cur.y - *ny).max(min_h(d))
+                                    }
                                     ResizeDir::N | ResizeDir::NE | ResizeDir::NW => {
                                         let bottom = *ny + *nh;
                                         *ny = cur.y.min(bottom - min_h(d));
@@ -510,11 +534,31 @@ unsafe extern "system" fn fence_wndproc(
                             apply(&mut nx, &mut ny, &mut nw, &mut nh, dir);
                             // 连续尺寸磁吸(平滑拉向整数格子,无跳变)+ clamp 工作区(防溢出)
                             let wa = work_area(hwnd);
-                            let nw2 = magnet_size_smooth(nw as f32, cell_w(f), 2 * margin(d) + rail(d), 0.5).round() as i32;
-                            let nh2 = magnet_size_smooth(nh as f32, cell_h(f), title_h(d) + 2 * margin(d), 0.5).round() as i32;
+                            let nw2 = magnet_size_smooth(
+                                nw as f32,
+                                cell_w(f),
+                                2 * margin(d) + rail(d),
+                                0.5,
+                            )
+                            .round() as i32;
+                            let nh2 = magnet_size_smooth(
+                                nh as f32,
+                                cell_h(f),
+                                title_h(d) + 2 * margin(d),
+                                0.5,
+                            )
+                            .round() as i32;
                             let nw = nw2.min((wa.right - nx).max(min_w(d)));
                             let nh = nh2.min((wa.bottom - ny).max(min_h(d)));
-                            let _ = SetWindowPos(hwnd, None, nx, ny, nw, nh, SWP_NOZORDER | SWP_NOACTIVATE);
+                            let _ = SetWindowPos(
+                                hwnd,
+                                None,
+                                nx,
+                                ny,
+                                nw,
+                                nh,
+                                SWP_NOZORDER | SWP_NOACTIVATE,
+                            );
                             // 实时跟随:同步 cfg 尺寸并重绘,内容平滑缩放(而非松手后瞬间刷新)。
                             // 每帧重新提交 ULW 表面,尺寸与窗口矩形保持一致。
                             f.cfg.x = nx;
@@ -537,12 +581,17 @@ unsafe extern "system" fn fence_wndproc(
                                 f.hover = None;
                                 if let Some(didx) = didx {
                                     if let Some(p) = f.entries.get(didx).map(|e| e.path.clone()) {
-                                        unsafe { let _ = ReleaseCapture(); };
+                                        unsafe {
+                                            let _ = ReleaseCapture();
+                                        };
                                         let vault = crate::config::vault_dir(&g.config);
                                         drag_path = Some((
-                                            p.to_string_lossy().to_string(),
+                                            p,
                                             vault,
                                             g.msg_hwnd,
+                                            f.cfg.id,
+                                            f.refresh_signal.clone(),
+                                            pending_outgoing.clone(),
                                             crate::perf::DropTrace::start(),
                                         ));
                                     }
@@ -565,7 +614,16 @@ unsafe extern "system" fn fence_wndproc(
                 }
             });
             // 在锁外启动 OLE 拖出(阻塞到松手);拖出后文件可能被移动/删除 → 重扫目录刷新
-            if let Some((path, vault, msg_hwnd, trace)) = drag_path {
+            if let Some((
+                path,
+                vault,
+                msg_hwnd,
+                source_fence_id,
+                completion_refresh,
+                pending_outgoing,
+                trace,
+            )) = drag_path
+            {
                 let threshold_elapsed = trace.elapsed();
                 trace.announce("out", 1);
                 if let Some(elapsed) = threshold_elapsed {
@@ -578,7 +636,10 @@ unsafe extern "system" fn fence_wndproc(
                     msg_hwnd,
                     "desktop_position_new_drag",
                 );
-                crate::begin_shortcut_dragout();
+                let shortcut_dragout = crate::shortcut::is_shortcut(&path);
+                if shortcut_dragout {
+                    crate::begin_shortcut_dragout();
+                }
                 trace.finish_stage("shortcut_begin", shortcut_begin_started, String::new);
 
                 // The safe UI driver only drags inside the selected window's bounds. In explicit
@@ -594,15 +655,18 @@ unsafe extern "system" fn fence_wndproc(
                 };
 
                 let name_check_started = trace.stage_start();
-                let desktop_name_state = crate::desktop_icons::snapshot_desktop_name(
-                    std::path::Path::new(&path),
-                );
+                let desktop_name_state = crate::desktop_icons::snapshot_desktop_name(&path);
                 trace.finish_stage("desktop_name_snapshot", name_check_started, || {
                     format!("scope=exclusive state={desktop_name_state:?}")
                 });
                 let ole_started = trace.stage_start();
-                let drag_result = crate::dragout::start_drag(vec![path.clone()], trace);
+                let drag_result = crate::dragout::start_drag(
+                    vec![path.clone()],
+                    desktop_name_state == crate::desktop_icons::DesktopNameState::Absent,
+                    trace,
+                );
                 let effect = drag_result.effect;
+                let desktop_transfer = drag_result.desktop_transfer;
                 trace.finish_stage("ole_modal", ole_started, || {
                     format!(
                         "scope=aggregate includes_pointer_hold=true effect_bits={}",
@@ -620,9 +684,10 @@ unsafe extern "system" fn fence_wndproc(
                     .and_then(|release| release.screen_point)
                     .is_some()
                     || GetCursorPos(&mut release_point).is_ok();
-                let dropped_on_desktop = effect.0 != 0
-                    && have_release_point
-                    && crate::desktop_icons::is_desktop_drop_point(release_point);
+                let dropped_on_desktop = desktop_transfer.is_some()
+                    || (effect.0 != 0
+                        && have_release_point
+                        && crate::desktop_icons::is_desktop_drop_point(release_point));
                 trace.finish_stage("desktop_check", desktop_check_started, || {
                     format!(
                         "effect_bits={} have_point={have_release_point} desktop={dropped_on_desktop} release_x={} release_y={}",
@@ -631,12 +696,21 @@ unsafe extern "system" fn fence_wndproc(
                 });
 
                 let shortcut_finish_started = trace.stage_start();
-                crate::finish_shortcut_dragout(dropped_on_desktop);
+                if shortcut_dragout && desktop_transfer.is_none() {
+                    crate::finish_shortcut_dragout(dropped_on_desktop);
+                }
                 trace.finish_stage("shortcut_finish", shortcut_finish_started, || {
-                    format!("desktop={dropped_on_desktop}")
+                    format!(
+                        "desktop={dropped_on_desktop} deferred={}",
+                        desktop_transfer.is_some()
+                    )
                 });
 
-                let position_queued = if dropped_on_desktop
+                let position_queued = if desktop_transfer.is_some() {
+                    // The transfer worker queues positioning with the actual collision-resolved
+                    // destination name after the file operation succeeds.
+                    true
+                } else if dropped_on_desktop
                     && !drag_result.newer_left_press
                     && captured_release
                         .and_then(|release| release.screen_point.map(|point| (release.at, point)))
@@ -647,10 +721,11 @@ unsafe extern "system" fn fence_wndproc(
                         .expect("captured release checked");
                     crate::desktop_icons::queue_file_at_drop_point(
                         msg_hwnd,
-                        std::path::Path::new(&path),
+                        &path,
                         desktop_name_state,
                         captured_point,
                         released_at,
+                        crate::desktop_icons::DropPositionOrigin::ExplorerDrop,
                         trace,
                     ) == crate::desktop_icons::QueueDropPosition::Queued
                 } else {
@@ -673,48 +748,217 @@ unsafe extern "system" fn fence_wndproc(
                     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 }
 
-                let mut fence_id = None;
+                let fence_id = Some(source_fence_id);
                 let mut scan_elapsed = None;
                 let mut render_elapsed = None;
+                let mut optimistic_source_hidden = false;
+                let dragged_path = path.clone();
+                let direct_move = desktop_transfer.is_some();
+                let pending_lease =
+                    direct_move.then(|| pending_outgoing.begin(dragged_path.clone()));
                 with_global(|g| {
                     if let Some(idx) = fence_idx(g, hwnd) {
                         let f = &mut g.fences[idx];
-                        fence_id = Some(f.cfg.id);
-                        let keep_page = f.page;
-                        let scan_started = trace.stage_start();
-                        refresh_entries(f, &vault);
-                        scan_elapsed = scan_started.map(|started| started.elapsed());
-                        // 拖出后尽量留在原页(条目减少时收敛到最后一页)
-                        f.page = keep_page.min(total_pages(f).saturating_sub(1));
-                        f.top_row = f.page as f32 * grid_dims(f).1 as f32;
-                        let render_started = trace.stage_start();
-                        render_fence(&mut g.icons, g.config.ghost_mode, f);
-                        render_elapsed = render_started.map(|started| started.elapsed());
+                        if desktop_transfer.is_some() {
+                            f.refresh_signal.cancel();
+                            stop_refresh_timer(hwnd);
+                            if direct_move {
+                                let keep_page = f.page;
+                                if let Some(entry_idx) = f
+                                    .entries
+                                    .iter()
+                                    .position(|entry| entry.path == dragged_path)
+                                {
+                                    f.entries.remove(entry_idx);
+                                    f.selected = None;
+                                    f.hover = None;
+                                    f.page = keep_page.min(total_pages(f).saturating_sub(1));
+                                    f.top_row = f.page as f32 * grid_dims(f).1 as f32;
+                                    let render_started = trace.stage_start();
+                                    render_fence(&mut g.icons, g.config.ghost_mode, f);
+                                    render_elapsed =
+                                        render_started.map(|started| started.elapsed());
+                                    optimistic_source_hidden = true;
+                                }
+                            }
+                        } else {
+                            let keep_page = f.page;
+                            let scan_started = trace.stage_start();
+                            let changed = refresh_entries(f, &vault);
+                            scan_elapsed = scan_started.map(|started| started.elapsed());
+                            // 拖出后尽量留在原页(条目减少时收敛到最后一页)
+                            f.page = keep_page.min(total_pages(f).saturating_sub(1));
+                            f.top_row = f.page as f32 * grid_dims(f).1 as f32;
+                            if changed {
+                                let render_started = trace.stage_start();
+                                render_fence(&mut g.icons, g.config.ghost_mode, f);
+                                render_elapsed = render_started.map(|started| started.elapsed());
+                            }
+                        }
                     }
                 });
+                if optimistic_source_hidden {
+                    trace.event("source_optimistic_hide", || {
+                        format!(
+                            "fence={} path={}",
+                            fence_id.unwrap_or_default(),
+                            path.display()
+                        )
+                    });
+                }
                 if let Some(elapsed) = scan_elapsed {
                     trace.record_stage("fence_scan", elapsed, || {
-                        format!(
-                            "scope=exclusive fence={}",
-                            fence_id.unwrap_or_default()
-                        )
+                        format!("scope=exclusive fence={}", fence_id.unwrap_or_default())
                     });
                 }
                 if let Some(elapsed) = render_elapsed {
                     trace.record_stage("fence_render", elapsed, || {
-                        format!(
-                            "scope=exclusive fence={}",
-                            fence_id.unwrap_or_default()
-                        )
+                        format!("scope=exclusive fence={}", fence_id.unwrap_or_default())
                     });
                 }
 
                 trace.finish_stage("post_ole", post_ole_started, || {
                     format!(
-                        "scope=aggregate effect_bits={} desktop={dropped_on_desktop} position_queued={position_queued}",
-                        effect.0
+                        "scope=aggregate effect_bits={} desktop={dropped_on_desktop} position_queued={position_queued} direct_transfer={}",
+                        effect.0,
+                        desktop_transfer.is_some(),
                     )
                 });
+                if let Some(transfer) = desktop_transfer {
+                    let source = dragged_path;
+                    let allow_position = !drag_result.newer_left_press;
+                    let refresh_signal = completion_refresh;
+                    let spawn_failure_refresh = refresh_signal.clone();
+                    let msg_hwnd_value = msg_hwnd.0 as usize;
+                    let spawn_result = std::thread::Builder::new()
+                        .name("feather-desktop-transfer".into())
+                        .spawn(move || {
+                            let message_window =
+                                HWND(msg_hwnd_value as *mut std::ffi::c_void);
+                            let mut prepared_position = None;
+                            let result = (|| {
+                                let desktop = crate::desktop_dir().ok_or_else(|| {
+                                    "无法定位当前用户的桌面目录".to_string()
+                                })?;
+                                if crate::desktop_icons::snapshot_desktop_name(&source)
+                                    != crate::desktop_icons::DesktopNameState::Absent
+                                {
+                                    return Err(
+                                        "拖动期间桌面出现了同名项目，已保留栅栏中的源文件"
+                                            .to_string(),
+                                    );
+                                }
+                                if allow_position {
+                                    let point = transfer.release.screen_point.ok_or_else(|| {
+                                        "未能保留桌面释放坐标".to_string()
+                                    })?;
+                                    let name = source.file_name().ok_or_else(|| {
+                                        "源项目没有可用的文件名".to_string()
+                                    })?;
+                                    let expected_destination = desktop.join(name);
+                                    let prepare_started = std::time::Instant::now();
+                                    let prepared =
+                                        crate::desktop_icons::prepare_direct_drop_position(
+                                            &expected_destination,
+                                            point,
+                                            transfer.release.at,
+                                            trace,
+                                        )
+                                        .map_err(|error| {
+                                            format!("无法准备桌面图标落点：{error}")
+                                        })?;
+                                    trace.record_stage(
+                                        "desktop_position_prepare",
+                                        prepare_started.elapsed(),
+                                        || "scope=transfer-worker ok=true".to_string(),
+                                    );
+                                    prepared_position = Some(prepared);
+                                }
+
+                                let transfer_started = std::time::Instant::now();
+                                let moved = crate::fencelife::move_item_to_desktop_unpublished(
+                                    &source,
+                                    &desktop,
+                                );
+                                trace.record_stage(
+                                    "desktop_file_transfer",
+                                    transfer_started.elapsed(),
+                                    || {
+                                        format!(
+                                            "scope=worker mode=move ok={} source={}",
+                                            moved.is_ok(),
+                                            source.display(),
+                                        )
+                                    },
+                                );
+                                moved
+                            })();
+
+                            let transfer_succeeded = result.is_ok();
+                            match result {
+                                Ok(completion) => {
+                                    let positioned = prepared_position
+                                        .as_mut()
+                                        .is_some_and(|prepared| prepared.position_after_move());
+                                    let publish_started = std::time::Instant::now();
+                                    let destination =
+                                        crate::fencelife::publish_desktop_move(completion);
+                                    trace.record_stage(
+                                        "desktop_shell_publish",
+                                        publish_started.elapsed(),
+                                        || {
+                                            format!(
+                                                "scope=worker positioned_before_publish={positioned}"
+                                            )
+                                        },
+                                    );
+                                    if let Some(prepared) = prepared_position.take() {
+                                        prepared.finish_after_publish();
+                                    } else {
+                                        trace.finish("desktop_transferred_unpositioned", || {
+                                            format!(
+                                                "mode=move destination={} allow_position={allow_position}",
+                                                destination.display(),
+                                            )
+                                        });
+                                    }
+                                }
+                                Err(error) => {
+                                    crate::tray::notify_tip(
+                                        message_window,
+                                        "轻栅栏",
+                                        &format!("无法将项目移动到桌面：{error}"),
+                                    );
+                                    trace.finish("desktop_transfer_failed", || {
+                                        format!("mode=move error={error}")
+                                    });
+                                }
+                            }
+
+                            // Reconcile the source fence only after the move, coordinate, and
+                            // Shell publication sequence is complete. A failure restores it.
+                            drop(pending_lease);
+                            refresh_signal.post_by_id(message_window, source_fence_id);
+                            if shortcut_dragout {
+                                crate::finish_shortcut_dragout(transfer_succeeded);
+                            }
+                        });
+                    if let Err(error) = spawn_result {
+                        let message_window = HWND(msg_hwnd_value as *mut std::ffi::c_void);
+                        spawn_failure_refresh.post_by_id(message_window, source_fence_id);
+                        if shortcut_dragout {
+                            crate::finish_shortcut_dragout(false);
+                        }
+                        crate::tray::notify_tip(
+                            message_window,
+                            "FeatherFence",
+                            &format!("Could not start the desktop transfer worker: {error}"),
+                        );
+                        trace.finish("desktop_transfer_worker_failed", || {
+                            format!("error={error}")
+                        });
+                    }
+                }
                 let outcome = if effect.0 == 0 {
                     "cancelled"
                 } else if dropped_on_desktop && position_queued {
@@ -859,7 +1103,8 @@ unsafe extern "system" fn fence_wndproc(
                     f.wheel_acc -= steps * 120;
                     let pages = total_pages(f);
                     let dir = if steps < 0 { 1 } else { -1 };
-                    let np = (f.page as i32 + dir * steps.abs()).clamp(0, pages as i32 - 1) as usize;
+                    let np =
+                        (f.page as i32 + dir * steps.abs()).clamp(0, pages as i32 - 1) as usize;
                     if np != f.page {
                         f.page = np;
                         start_page_anim(f);
@@ -1027,7 +1272,7 @@ unsafe extern "system" fn fence_wndproc(
 
 #[cfg(test)]
 mod pointer_interaction_tests {
-    use super::{reset_pointer_interaction, ResizeDir};
+    use super::{ResizeDir, reset_pointer_interaction};
     use crate::config::FenceCfg;
     use crate::fence::Fence;
     use windows::Win32::Foundation::HWND;

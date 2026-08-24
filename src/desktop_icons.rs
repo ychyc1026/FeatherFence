@@ -4,7 +4,7 @@ use std::ffi::c_void;
 use std::mem::{size_of, ManuallyDrop};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -234,17 +234,42 @@ pub fn reserve(reserved_screen: &[RECT]) {
 }
 
 const DROP_POSITION_RETRY_MS: u32 = 30;
+const DROP_POSITION_EAGER_RETRY_MS: u32 = 8;
 const DROP_POSITION_SETTLE_DELAY: Duration = Duration::from_millis(330);
 const DROP_POSITION_TIMEOUT: Duration = Duration::from_millis(2000);
 const POINTER_WATCH_POLL: Duration = Duration::from_millis(8);
 const MAX_DROP_POSITION_WORKERS: u32 = 2;
 static DROP_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_DROP_POSITION_WORKERS: AtomicU32 = AtomicU32::new(0);
+static DIRECT_POSITION_WARM_LIST: AtomicUsize = AtomicUsize::new(0);
+static DIRECT_POSITION_WARMING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QueueDropPosition {
     Queued,
     Rejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DropPositionOrigin {
+    /// Explorer completed the file transfer and may still be settling its native drop layout.
+    ExplorerDrop,
+    /// FeatherFence completed an exact desktop MOVE and should position as soon as the item
+    /// enters the folder view, without exposing the default first-empty-cell position for 330ms.
+    DirectMove,
+}
+
+fn position_timing(origin: DropPositionOrigin) -> (Duration, Duration) {
+    match origin {
+        DropPositionOrigin::ExplorerDrop => (
+            DROP_POSITION_SETTLE_DELAY,
+            Duration::from_millis(DROP_POSITION_RETRY_MS as u64),
+        ),
+        DropPositionOrigin::DirectMove => (
+            Duration::ZERO,
+            Duration::from_millis(DROP_POSITION_EAGER_RETRY_MS as u64),
+        ),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,6 +295,7 @@ fn pointer_state_has_press(state: u16) -> bool {
 
 struct DesktopDropJob {
     generation: u64,
+    origin: DropPositionOrigin,
     label: String,
     label_w: Vec<u16>,
     screen_point: POINT,
@@ -279,10 +305,12 @@ struct DesktopDropJob {
     started: Instant,
     released_at: Instant,
     not_before: Instant,
+    retry_delay: Duration,
     attempts: u32,
     view_attempts: u32,
     resolve_attempts: u32,
     probe_attempts: u32,
+    position_attempts: u32,
     appeared: bool,
     trace: crate::perf::DropTrace,
     total_started: Option<Instant>,
@@ -321,6 +349,73 @@ unsafe fn desktop_folder_view() -> windows::core::Result<IFolderView> {
     let browser: IShellBrowser = unsafe { services.QueryService(&SID_STopLevelBrowser)? };
     let shell_view = unsafe { browser.QueryActiveShellView()? };
     shell_view.cast()
+}
+
+/// Warm the out-of-process Shell view on a short-lived STA thread. The first ShellWindows query
+/// can take hundreds of milliseconds; the direct MOVE path must never publish a desktop item
+/// while paying that cold-start cost, otherwise Explorer visibly paints its default position.
+pub(crate) fn warm_direct_drop_positioner() {
+    let Some(list) = crate::utils::find_desktop_listview() else {
+        return;
+    };
+    let list_value = list.0 as usize;
+    if DIRECT_POSITION_WARM_LIST.load(Ordering::Acquire) == list_value
+        || DIRECT_POSITION_WARMING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    let spawn = thread::Builder::new()
+        .name("feather-desktop-position-warmup".into())
+        .spawn(move || {
+            let started = Instant::now();
+            let initialized = unsafe {
+                CoInitializeEx(
+                    None,
+                    COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+                )
+            };
+            let ready = if initialized.is_ok() {
+                prepare_sta_message_queue();
+                let acquired = unsafe { desktop_folder_view() };
+                let ready = acquired.is_ok();
+                drop(acquired);
+                unsafe { CoUninitialize() };
+                ready
+            } else {
+                false
+            };
+            if ready
+                && crate::utils::find_desktop_listview()
+                    .is_some_and(|current| current.0 as usize == list_value)
+            {
+                DIRECT_POSITION_WARM_LIST.store(list_value, Ordering::Release);
+            }
+            DIRECT_POSITION_WARMING.store(false, Ordering::Release);
+            if crate::perf::enabled() {
+                crate::dlog(&format!(
+                    "[desktop-drop] positioner_warmup ready={ready} elapsed_us={}",
+                    started.elapsed().as_micros()
+                ));
+            }
+        });
+    if spawn.is_err() {
+        DIRECT_POSITION_WARMING.store(false, Ordering::Release);
+    }
+}
+
+/// Fail closed when Explorer rebuilt the desktop view or warm-up has not completed. That drag
+/// remains on Explorer's native Drop path; a following drag can use the fast path once ready.
+pub(crate) fn direct_drop_positioner_ready() -> bool {
+    let Some(list) = crate::utils::find_desktop_listview() else {
+        return false;
+    };
+    let ready = DIRECT_POSITION_WARM_LIST.load(Ordering::Acquire) == list.0 as usize;
+    if !ready {
+        warm_direct_drop_positioner();
+    }
+    ready
 }
 
 struct OwnedPidl(*mut ITEMIDLIST);
@@ -379,6 +474,33 @@ unsafe fn point_hits_desktop_list(list: HWND, screen: POINT) -> bool {
     false
 }
 
+unsafe fn is_same_or_descendant(mut window: HWND, ancestor: HWND) -> bool {
+    for _ in 0..10 {
+        if window == ancestor {
+            return true;
+        }
+        if window.is_invalid() {
+            return false;
+        }
+        let Ok(parent) = (unsafe { GetParent(window) }) else {
+            return false;
+        };
+        if parent.is_invalid() || parent == window {
+            return false;
+        }
+        window = parent;
+    }
+    false
+}
+
+unsafe fn target_belongs_to_desktop_list(target: HWND, list: HWND) -> bool {
+    // OLE reports a potential drop-target window. Explorer may register the ListView itself or
+    // one of its parents (WorkerW on current Windows). Require that exact target to be an
+    // ancestor of the one desktop ListView; accepting descendants could swallow a future child
+    // control's independent drop behavior.
+    unsafe { is_same_or_descendant(list, target) }
+}
+
 /// True when the release point belongs to Explorer's desktop ListView rather than a fence or
 /// another Explorer window. This is also used to keep our desktop shortcut collector from
 /// immediately reclaiming a shortcut that the user just dragged out of a fence.
@@ -387,6 +509,197 @@ pub fn is_desktop_drop_point(screen_point: POINT) -> bool {
         return false;
     };
     unsafe { point_hits_desktop_list(list, screen_point) }
+}
+
+/// Check an empty desktop cell using OLE's current registered target instead of
+/// `WindowFromPoint`. During a drag the latter can see the transient drag-image window.
+pub fn is_empty_desktop_drop_target(target: HWND, screen_point: POINT) -> bool {
+    if !direct_drop_positioner_ready() {
+        return false;
+    }
+    let Some(list) = crate::utils::find_desktop_listview() else {
+        return false;
+    };
+    unsafe {
+        // Automatic arrangement would immediately override the captured coordinate. Keep that
+        // drag on Explorer's native path instead of cancelling it and failing after release.
+        if GetWindowLongPtrW(list, GWL_STYLE) & LVS_AUTOARRANGE as isize != 0 {
+            return false;
+        }
+        if target.is_invalid() || !target_belongs_to_desktop_list(target, list) {
+            if crate::perf::enabled() {
+                crate::dlog(&format!(
+                    "[desktop-fast-path] point=({}, {}) result=wrong_target target=0x{:x} list=0x{:x}",
+                    screen_point.x,
+                    screen_point.y,
+                    target.0 as usize,
+                    list.0 as usize,
+                ));
+            }
+            return false;
+        }
+        is_empty_desktop_list_cell(list, screen_point)
+    }
+}
+
+fn desktop_hit_test_timeout(deadline: Instant) -> Option<u32> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(remaining.as_millis().clamp(1, 50) as u32)
+}
+
+unsafe fn is_empty_desktop_list_cell(list: HWND, screen_point: POINT) -> bool {
+    unsafe {
+        let deadline = Instant::now() + Duration::from_millis(75);
+        let mut client_point = screen_point;
+        if !ScreenToClient(list, &mut client_point).as_bool() {
+            return false;
+        }
+        let mut client = RECT::default();
+        if GetClientRect(list, &mut client).is_err()
+            || client_point.x < client.left
+            || client_point.x >= client.right
+            || client_point.y < client.top
+            || client_point.y >= client.bottom
+        {
+            return false;
+        }
+        let mut count_result = 0usize;
+        let Some(timeout_ms) = desktop_hit_test_timeout(deadline) else {
+            return false;
+        };
+        if SendMessageTimeoutW(
+            list,
+            LVM_GETITEMCOUNT,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            timeout_ms,
+            Some(&mut count_result),
+        )
+        .0
+            == 0
+        {
+            return false;
+        }
+        let count = count_result as i32;
+        if count <= 0 {
+            return true;
+        }
+        let mut spacing_result = 0usize;
+        let Some(timeout_ms) = desktop_hit_test_timeout(deadline) else {
+            return false;
+        };
+        if SendMessageTimeoutW(
+            list,
+            LVM_GETITEMSPACING,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            timeout_ms,
+            Some(&mut spacing_result),
+        )
+        .0
+            == 0
+        {
+            return false;
+        }
+        let packed = spacing_result as u32;
+        let cell_w = ((packed & 0xffff) as i32).max(48);
+        let cell_h = ((packed >> 16) as i32).max(48);
+
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(list, Some(&mut pid));
+        let Ok(process) = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ, false, pid) else {
+            return false;
+        };
+        let remote = VirtualAllocEx(
+            process,
+            None,
+            size_of::<POINT>(),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        if remote.is_null() {
+            let _ = CloseHandle(process);
+            return false;
+        }
+
+        let mut empty = true;
+        for index in 0..count {
+            let Some(timeout_ms) = desktop_hit_test_timeout(deadline) else {
+                if crate::perf::enabled() {
+                    crate::dlog(&format!(
+                        "[desktop-fast-path] point=({}, {}) result=budget_exhausted index={index}",
+                        screen_point.x, screen_point.y
+                    ));
+                }
+                empty = false;
+                break;
+            };
+            let mut position_result = 0usize;
+            let sent = SendMessageTimeoutW(
+                list,
+                LVM_GETITEMPOSITION,
+                WPARAM(index as usize),
+                LPARAM(remote as isize),
+                SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                timeout_ms,
+                Some(&mut position_result),
+            );
+            let mut position = POINT::default();
+            if sent.0 == 0
+                || position_result == 0
+                || ReadProcessMemory(
+                    process,
+                    remote,
+                    &mut position as *mut POINT as *mut c_void,
+                    size_of::<POINT>(),
+                    None,
+                )
+                .is_err()
+            {
+                if crate::perf::enabled() {
+                    crate::dlog(&format!(
+                        "[desktop-fast-path] point=({}, {}) result=position_read_failed index={index}",
+                        screen_point.x, screen_point.y
+                    ));
+                }
+                empty = false;
+                break;
+            }
+            if client_point.x >= position.x
+                && client_point.x < position.x + cell_w
+                && client_point.y >= position.y
+                && client_point.y < position.y + cell_h
+            {
+                if crate::perf::enabled() {
+                    crate::dlog(&format!(
+                        "[desktop-fast-path] point=({}, {}) result=occupied index={index} icon=({}, {}) cell={}x{}",
+                        screen_point.x,
+                        screen_point.y,
+                        position.x,
+                        position.y,
+                        cell_w,
+                        cell_h,
+                    ));
+                }
+                empty = false;
+                break;
+            }
+        }
+        let _ = VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+        let _ = CloseHandle(process);
+        if empty && crate::perf::enabled() {
+            crate::dlog(&format!(
+                "[desktop-fast-path] point=({}, {}) result=empty",
+                screen_point.x, screen_point.y
+            ));
+        }
+        empty
+    }
 }
 
 unsafe fn desired_drop_position(list: HWND, screen_point: POINT) -> Result<POINT, &'static str> {
@@ -487,11 +800,12 @@ fn finish_drop_job(job: DesktopDropJob, outcome: &'static str, positioned: bool)
     job.trace
         .finish_stage("desktop_position_total", job.total_started, || {
             format!(
-                "scope=aggregate ok={positioned} outcome={outcome} attempts={} view_attempts={} resolve_attempts={} probe_attempts={} appeared={} wall_us={}",
+                "scope=aggregate ok={positioned} outcome={outcome} attempts={} view_attempts={} resolve_attempts={} probe_attempts={} position_attempts={} appeared={} wall_us={}",
                 job.attempts,
                 job.view_attempts,
                 job.resolve_attempts,
                 job.probe_attempts,
+                job.position_attempts,
                 job.appeared,
                 job.started.elapsed().as_micros(),
             )
@@ -582,9 +896,46 @@ fn worker_pause(
     worker_gate(job, new_pointer_press)
 }
 
+unsafe fn select_job_position(
+    job: &mut DesktopDropJob,
+    view: &IFolderView,
+    pidl: &OwnedPidl,
+) -> bool {
+    let child = pidl.0 as *const ITEMIDLIST;
+    job.position_attempts += 1;
+    let position_started = job.trace.stage_start();
+    let positioned = unsafe {
+        view.SelectAndPositionItems(
+            1,
+            &child,
+            Some(&job.desired),
+            SVSI_POSITIONITEM.0 as u32,
+        )
+        .is_ok()
+    };
+    job.trace
+        .finish_stage("desktop_position", position_started, || {
+            format!(
+                "scope=worker attempt={} ok={positioned} requested_x={} requested_y={}",
+                job.position_attempts, job.desired.x, job.desired.y
+            )
+        });
+    crate::dlog(&format!(
+        "[desktop-drop] item=\"{}\" method=folder-view-worker release=({}, {}) requested=({}, {}) positioned={}",
+        job.label,
+        job.screen_point.x,
+        job.screen_point.y,
+        job.desired.x,
+        job.desired.y,
+        positioned
+    ));
+    positioned
+}
+
 unsafe fn position_on_worker(
     job: &mut DesktopDropJob,
     new_pointer_press: &AtomicBool,
+    initial_view: Option<IFolderView>,
 ) -> WorkerOutcome {
     while Instant::now() < job.not_before {
         if let Some(outcome) = worker_gate(job, new_pointer_press) {
@@ -594,14 +945,14 @@ unsafe fn position_on_worker(
         if let Some(outcome) = worker_pause(
             job,
             new_pointer_press,
-            Duration::from_millis(DROP_POSITION_RETRY_MS as u64).min(remaining),
+            job.retry_delay.min(remaining),
         ) {
             return outcome;
         }
     }
 
     let mut list = HWND(job.list_value as *mut c_void);
-    let mut view: Option<IFolderView> = None;
+    let mut view = initial_view;
     let mut pidl: Option<OwnedPidl> = None;
     let mut consecutive_resolve_failures = 0u8;
     let mut consecutive_probe_failures = 0u8;
@@ -618,7 +969,7 @@ unsafe fn position_on_worker(
             if let Some(outcome) = worker_pause(
                 job,
                 new_pointer_press,
-                Duration::from_millis(DROP_POSITION_RETRY_MS as u64),
+                job.retry_delay,
             ) {
                 return outcome;
             }
@@ -627,6 +978,7 @@ unsafe fn position_on_worker(
         if current_list != list {
             pidl.take();
             view.take();
+            job.desired_ready = false;
             consecutive_resolve_failures = 0;
             consecutive_probe_failures = 0;
             list = current_list;
@@ -656,7 +1008,7 @@ unsafe fn position_on_worker(
                     if let Some(outcome) = worker_pause(
                         job,
                         new_pointer_press,
-                        Duration::from_millis(DROP_POSITION_RETRY_MS as u64),
+                        job.retry_delay,
                     ) {
                         return outcome;
                     }
@@ -699,13 +1051,78 @@ unsafe fn position_on_worker(
                     if let Some(outcome) = worker_pause(
                         job,
                         new_pointer_press,
-                        Duration::from_millis(DROP_POSITION_RETRY_MS as u64),
+                        job.retry_delay,
                     ) {
                         return outcome;
                     }
                     continue;
                 }
             }
+        }
+
+        if job.origin == DropPositionOrigin::DirectMove {
+            let Some(final_list) = crate::utils::find_desktop_listview() else {
+                return WorkerOutcome {
+                    outcome: "desktop_position_view_lost_before_write",
+                    positioned: false,
+                };
+            };
+            if final_list != list {
+                pidl.take();
+                view.take();
+                job.desired_ready = false;
+                consecutive_resolve_failures = 0;
+                consecutive_probe_failures = 0;
+                list = final_list;
+                job.list_value = final_list.0 as usize;
+                continue;
+            }
+            if !job.desired_ready {
+                job.desired = match unsafe { desired_drop_position(final_list, job.screen_point) } {
+                    Ok(desired) => desired,
+                    Err("auto_arrange") => {
+                        return WorkerOutcome {
+                            outcome: "desktop_position_auto_arrange",
+                            positioned: false,
+                        };
+                    }
+                    Err(_) => {
+                        return WorkerOutcome {
+                            outcome: "desktop_position_geometry_failed_before_write",
+                            positioned: false,
+                        };
+                    }
+                };
+                job.desired_ready = true;
+            }
+            if let Some(outcome) = worker_gate(job, new_pointer_press) {
+                return outcome;
+            }
+            let positioned = unsafe {
+                select_job_position(
+                    job,
+                    view.as_ref().expect("view acquired"),
+                    pidl.as_ref().expect("pidl resolved"),
+                )
+            };
+            if positioned {
+                job.appeared = true;
+                return WorkerOutcome {
+                    outcome: "desktop_positioned_eagerly",
+                    positioned: true,
+                };
+            }
+            consecutive_probe_failures = consecutive_probe_failures.saturating_add(1);
+            if consecutive_probe_failures >= 3 {
+                pidl.take();
+                view.take();
+                consecutive_probe_failures = 0;
+                consecutive_resolve_failures = 0;
+            }
+            if let Some(outcome) = worker_pause(job, new_pointer_press, job.retry_delay) {
+                return outcome;
+            }
+            continue;
         }
 
         job.probe_attempts += 1;
@@ -744,7 +1161,7 @@ unsafe fn position_on_worker(
                 if let Some(outcome) = worker_pause(
                     job,
                     new_pointer_press,
-                    Duration::from_millis(DROP_POSITION_RETRY_MS as u64),
+                    job.retry_delay,
                 ) {
                     return outcome;
                 }
@@ -761,6 +1178,7 @@ unsafe fn position_on_worker(
         if final_list != list {
             pidl.take();
             view.take();
+            job.desired_ready = false;
             consecutive_resolve_failures = 0;
             consecutive_probe_failures = 0;
             list = final_list;
@@ -798,36 +1216,13 @@ unsafe fn position_on_worker(
             };
         }
 
-        let child = pidl.as_ref().expect("pidl resolved").0 as *const ITEMIDLIST;
-        let position_started = job.trace.stage_start();
         let positioned = unsafe {
-            view
-                .as_ref()
-                .expect("view acquired")
-                .SelectAndPositionItems(
-                    1,
-                    &child,
-                    Some(&job.desired),
-                    SVSI_POSITIONITEM.0 as u32,
-                )
-                .is_ok()
+            select_job_position(
+                job,
+                view.as_ref().expect("view acquired"),
+                pidl.as_ref().expect("pidl resolved"),
+            )
         };
-        job.trace
-            .finish_stage("desktop_position", position_started, || {
-                format!(
-                    "scope=worker ok={positioned} requested_x={} requested_y={}",
-                    job.desired.x, job.desired.y
-                )
-            });
-        crate::dlog(&format!(
-            "[desktop-drop] item=\"{}\" method=folder-view-worker release=({}, {}) requested=({}, {}) positioned={}",
-            job.label,
-            job.screen_point.x,
-            job.screen_point.y,
-            job.desired.x,
-            job.desired.y,
-            positioned
-        ));
         return WorkerOutcome {
             outcome: if positioned {
                 "desktop_positioned"
@@ -904,7 +1299,7 @@ fn run_drop_position_worker(mut job: DesktopDropJob) {
     };
     let outcome = if initialized.is_ok() {
         prepare_sta_message_queue();
-        let outcome = unsafe { position_on_worker(&mut job, &pointer_watch.pressed) };
+        let outcome = unsafe { position_on_worker(&mut job, &pointer_watch.pressed, None) };
         unsafe { CoUninitialize() };
         outcome
     } else {
@@ -916,6 +1311,163 @@ fn run_drop_position_worker(mut job: DesktopDropJob) {
     finish_drop_job(job, outcome.outcome, outcome.positioned);
 }
 
+/// Prepared on the existing desktop-transfer worker before the file enters the Desktop folder.
+/// Keeping the Shell view alive on that same STA lets the worker submit the release coordinate
+/// before explicitly publishing the filesystem change to Explorer.
+pub(crate) struct PreparedDirectDropPosition {
+    job: Option<DesktopDropJob>,
+    view: Option<IFolderView>,
+    pointer_watch: PointerPressWatch,
+    outcome: Option<WorkerOutcome>,
+}
+
+impl PreparedDirectDropPosition {
+    /// Position the item after the atomic move and before the caller publishes its Shell change.
+    pub(crate) fn position_after_move(&mut self) -> bool {
+        if self.outcome.is_none() {
+            let job = self.job.as_mut().expect("prepared direct-drop job");
+            self.outcome = Some(unsafe {
+                position_on_worker(
+                    job,
+                    &self.pointer_watch.pressed,
+                    self.view.take(),
+                )
+            });
+        }
+        self.outcome.is_some_and(|outcome| outcome.positioned)
+    }
+
+    /// Finish the shared drag trace only after the caller has published the matching Shell event.
+    pub(crate) fn finish_after_publish(mut self) -> bool {
+        let outcome = self.outcome.unwrap_or(WorkerOutcome {
+            outcome: "desktop_position_not_attempted",
+            positioned: false,
+        });
+        let job = self.job.take().expect("prepared direct-drop job");
+        finish_drop_job(job, outcome.outcome, outcome.positioned);
+        outcome.positioned
+    }
+}
+
+impl Drop for PreparedDirectDropPosition {
+    fn drop(&mut self) {
+        // IFolderView is apartment-affine. Release it on this worker before balancing COM.
+        drop(self.view.take());
+        unsafe { CoUninitialize() };
+    }
+}
+
+/// Acquire the desktop Shell view and calculate the requested cell before moving the file.
+/// Preparation failure is returned to the transfer worker so it can leave the source untouched.
+pub(crate) fn prepare_direct_drop_position(
+    expected_destination: &Path,
+    screen_point: POINT,
+    released_at: Instant,
+    trace: crate::perf::DropTrace,
+) -> Result<PreparedDirectDropPosition, String> {
+    let total_started = trace.stage_start();
+    let started = Instant::now();
+    if released_at.elapsed() >= DROP_POSITION_TIMEOUT {
+        return Err("desktop release expired before positioning was prepared".to_string());
+    }
+    let label_os = expected_destination
+        .file_name()
+        .ok_or_else(|| "desktop destination has no file name".to_string())?;
+    let label = label_os.to_string_lossy().into_owned();
+    let label_w: Vec<u16> = label_os.encode_wide().chain(std::iter::once(0)).collect();
+    let list = crate::utils::find_desktop_listview()
+        .ok_or_else(|| "desktop list view is unavailable".to_string())?;
+    if DIRECT_POSITION_WARM_LIST.load(Ordering::Acquire) != list.0 as usize {
+        warm_direct_drop_positioner();
+        return Err("desktop positioner is not ready for the current view".to_string());
+    }
+    let desired = unsafe { desired_drop_position(list, screen_point) }
+        .map_err(|reason| format!("desktop drop geometry is unavailable: {reason}"))?;
+
+    // Clear the completed drag transition before the watcher starts looking for a new click.
+    let button_baseline = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16;
+    if pointer_state_has_press(button_baseline) {
+        return Err("new pointer interaction started before positioning".to_string());
+    }
+    let generation = next_drop_generation();
+    let pointer_watch = PointerPressWatch::start(
+        generation,
+        released_at + DROP_POSITION_TIMEOUT,
+    )
+    .map_err(|error| format!("could not start desktop pointer guard: {error}"))?;
+
+    let initialized = unsafe {
+        CoInitializeEx(
+            None,
+            COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+        )
+    };
+    initialized
+        .ok()
+        .map_err(|error| format!("could not initialize desktop positioning STA: {error}"))?;
+    prepare_sta_message_queue();
+
+    let view_started = trace.stage_start();
+    let view_result = unsafe { desktop_folder_view() };
+    trace.finish_stage("desktop_view", view_started, || {
+        format!("scope=prepared attempt=1 ok={}", view_result.is_ok())
+    });
+    let view = match view_result {
+        Ok(view) => view,
+        Err(error) => {
+            unsafe { CoUninitialize() };
+            return Err(format!("could not acquire desktop folder view: {error}"));
+        }
+    };
+    if crate::utils::find_desktop_listview() != Some(list) {
+        drop(view);
+        unsafe { CoUninitialize() };
+        return Err("desktop view changed while positioning was prepared".to_string());
+    }
+
+    let job = DesktopDropJob {
+        generation,
+        origin: DropPositionOrigin::DirectMove,
+        label,
+        label_w,
+        screen_point,
+        list_value: list.0 as usize,
+        desired,
+        desired_ready: true,
+        started,
+        released_at,
+        not_before: released_at,
+        retry_delay: Duration::from_millis(DROP_POSITION_EAGER_RETRY_MS as u64),
+        attempts: 0,
+        view_attempts: 1,
+        resolve_attempts: 0,
+        probe_attempts: 0,
+        position_attempts: 0,
+        appeared: false,
+        trace,
+        total_started,
+    };
+    if let Some(outcome) = worker_gate(&job, &pointer_watch.pressed) {
+        drop(view);
+        unsafe { CoUninitialize() };
+        return Err(format!("desktop positioning was cancelled: {}", outcome.outcome));
+    }
+    trace.event("desktop_position_prepared", || {
+        format!(
+            "scope=transfer-worker requested_x={} requested_y={} release_age_us={}",
+            desired.x,
+            desired.y,
+            released_at.elapsed().as_micros(),
+        )
+    });
+    Ok(PreparedDirectDropPosition {
+        job: Some(job),
+        view: Some(view),
+        pointer_watch,
+        outcome: None,
+    })
+}
+
 /// Queue a bounded background-STA job that waits for Explorer to publish the new desktop item.
 /// The UI thread performs only cheap validation and never runs Shell COM or sleeps.
 pub(crate) fn queue_file_at_drop_point(
@@ -924,6 +1476,7 @@ pub(crate) fn queue_file_at_drop_point(
     name_state: DesktopNameState,
     screen_point: POINT,
     released_at: Instant,
+    origin: DropPositionOrigin,
     trace: crate::perf::DropTrace,
 ) -> QueueDropPosition {
     match name_state {
@@ -962,7 +1515,9 @@ pub(crate) fn queue_file_at_drop_point(
         });
         return QueueDropPosition::Rejected;
     };
-    if !unsafe { point_hits_desktop_list(list, screen_point) } {
+    if origin == DropPositionOrigin::ExplorerDrop
+        && !unsafe { point_hits_desktop_list(list, screen_point) }
+    {
         trace.event("desktop_position_rejected", || {
             "reason=release_not_on_desktop".to_string()
         });
@@ -971,11 +1526,14 @@ pub(crate) fn queue_file_at_drop_point(
     let generation = next_drop_generation();
     let label_w: Vec<u16> = label_os.encode_wide().chain(std::iter::once(0)).collect();
     let started = Instant::now();
-    // Explorer may keep OLE busy long after the physical release. Count the publish grace period
-    // from that release so the background worker does not add another fixed delay afterward.
-    let not_before = released_at + DROP_POSITION_SETTLE_DELAY;
+    // Explorer-owned drops retain their publish grace period. A direct MOVE has already been
+    // validated and completed by FeatherFence, so waiting here would deliberately expose the
+    // default first-empty-cell position before moving the icon to the captured release point.
+    let (settle_delay, retry_delay) = position_timing(origin);
+    let not_before = released_at + settle_delay;
     let job = DesktopDropJob {
         generation,
+        origin,
         label,
         label_w,
         screen_point,
@@ -985,10 +1543,12 @@ pub(crate) fn queue_file_at_drop_point(
         started,
         released_at,
         not_before,
+        retry_delay,
         attempts: 0,
         view_attempts: 0,
         resolve_attempts: 0,
         probe_attempts: 0,
+        position_attempts: 0,
         appeared: false,
         trace,
         total_started: trace.stage_start(),
@@ -1032,8 +1592,8 @@ pub(crate) fn queue_file_at_drop_point(
     }
     trace.event("desktop_position_queued", || {
         format!(
-            "scope=worker timeout_ms={} settle_delay_ms={} pointer_watch_ms={} requested=pending",
-            DROP_POSITION_TIMEOUT.as_millis(), DROP_POSITION_SETTLE_DELAY.as_millis(),
+            "scope=worker origin={origin:?} timeout_ms={} settle_delay_ms={} retry_ms={} pointer_watch_ms={} requested=pending",
+            DROP_POSITION_TIMEOUT.as_millis(), settle_delay.as_millis(), retry_delay.as_millis(),
             POINTER_WATCH_POLL.as_millis(),
         )
     });
@@ -1127,10 +1687,10 @@ pub fn restore_autoarrange() {
 #[cfg(test)]
 mod drop_position_tests {
     use super::{
-        centered_icon_position, pointer_state_has_press, position_attempt_gate,
-        PositionAttemptGate,
+        centered_icon_position, desktop_hit_test_timeout, pointer_state_has_press,
+        position_attempt_gate, position_timing, DropPositionOrigin, PositionAttemptGate,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use windows::Win32::Foundation::{POINT, RECT};
 
     #[test]
@@ -1168,11 +1728,32 @@ mod drop_position_tests {
     }
 
     #[test]
+    fn desktop_hit_test_has_a_bounded_message_timeout() {
+        assert_eq!(
+            desktop_hit_test_timeout(Instant::now() - Duration::from_millis(1)),
+            None
+        );
+        assert!(desktop_hit_test_timeout(Instant::now() + Duration::from_secs(1))
+            .is_some_and(|timeout| (1..=50).contains(&timeout)));
+    }
+
+    #[test]
     fn new_input_cancels_before_the_write() {
         assert_eq!(
             position_attempt_gate(Duration::from_millis(100), true),
             PositionAttemptGate::Cancelled
         );
+    }
+
+    #[test]
+    fn direct_move_does_not_wait_at_the_default_desktop_position() {
+        let (direct_settle, direct_retry) = position_timing(DropPositionOrigin::DirectMove);
+        let (explorer_settle, explorer_retry) = position_timing(DropPositionOrigin::ExplorerDrop);
+
+        assert_eq!(direct_settle, Duration::ZERO);
+        assert_eq!(direct_retry, Duration::from_millis(8));
+        assert_eq!(explorer_settle, Duration::from_millis(330));
+        assert_eq!(explorer_retry, Duration::from_millis(30));
     }
 
     #[test]

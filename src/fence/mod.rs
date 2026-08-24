@@ -13,7 +13,8 @@ mod refresh;
 mod render;
 mod window;
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,11 +41,67 @@ pub const WM_APP_REFRESH_ID: u32 = WM_APP + 6;
 /// “显示桌面”会尝试最小化所有独立顶层窗口；异步恢复可避免在 WM_SIZE 内递归。
 pub const WM_APP_DESKTOP_RESTORE: u32 = WM_APP + 20;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Entry {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
+}
+
+#[derive(Default)]
+struct PendingOutgoingState {
+    next_token: u64,
+    paths: HashMap<PathBuf, u64>,
+}
+
+/// Temporary visibility filter for an outgoing MOVE. Disk scans remain authoritative, but a
+/// watcher event cannot reinsert the source icon while the background transfer is still running.
+#[derive(Clone, Default)]
+pub struct PendingOutgoing {
+    state: Arc<Mutex<PendingOutgoingState>>,
+}
+
+pub struct PendingOutgoingLease {
+    owner: PendingOutgoing,
+    path: PathBuf,
+    token: u64,
+}
+
+impl PendingOutgoing {
+    pub fn begin(&self, path: PathBuf) -> PendingOutgoingLease {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.next_token = state.next_token.wrapping_add(1).max(1);
+        let token = state.next_token;
+        state.paths.insert(path.clone(), token);
+        PendingOutgoingLease {
+            owner: self.clone(),
+            path,
+            token,
+        }
+    }
+
+    pub fn snapshot(&self) -> HashSet<PathBuf> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .paths
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn finish(&self, path: &Path, token: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.paths.get(path).copied() == Some(token) {
+            state.paths.remove(path);
+        }
+    }
+}
+
+impl Drop for PendingOutgoingLease {
+    fn drop(&mut self) {
+        self.owner.finish(&self.path, self.token);
+    }
 }
 
 struct RefreshState {
@@ -80,7 +137,7 @@ impl RefreshState {
         if elapsed < delay {
             let remaining = delay - elapsed;
             return RefreshTimerAction::Wait(
-                remaining.as_millis().clamp(1, u32::MAX as u128) as u32,
+                remaining.as_millis().clamp(1, u32::MAX as u128) as u32
             );
         }
         self.queued = false;
@@ -111,9 +168,41 @@ impl RefreshSignal {
         if !should_post {
             return;
         }
+        let posted = unsafe { PostMessageW(Some(hwnd), WM_APP_REFRESH, WPARAM(0), LPARAM(0)) };
+        if posted.is_err() {
+            self.cancel();
+        }
+    }
+
+    /// Directory watchers keep a stable fence id rather than a window handle because Explorer
+    /// recovery can replace the HWND. Coalesce at the watcher thread before routing that id back
+    /// through the process message window.
+    pub(crate) fn post_by_id(&self, msg_hwnd: HWND, fence_id: u32) {
+        let should_post = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_event(Instant::now());
+        if !should_post {
+            return;
+        }
         let posted = unsafe {
-            PostMessageW(Some(hwnd), WM_APP_REFRESH, WPARAM(0), LPARAM(0))
+            PostMessageW(
+                Some(msg_hwnd),
+                WM_APP_REFRESH_ID,
+                WPARAM(fence_id as usize),
+                LPARAM(0),
+            )
         };
+        if posted.is_err() {
+            self.cancel();
+        }
+    }
+
+    /// Route a previously coalesced id notification to the fence's current HWND without recording
+    /// another event or changing its quiet-period timestamp.
+    pub(crate) fn dispatch_to_current(&self, hwnd: HWND) {
+        let posted = unsafe { PostMessageW(Some(hwnd), WM_APP_REFRESH, WPARAM(0), LPARAM(0)) };
         if posted.is_err() {
             self.cancel();
         }
@@ -129,7 +218,7 @@ impl RefreshSignal {
             )
     }
 
-    fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -184,6 +273,7 @@ pub struct Fence {
     pub drag_down: (i32, i32),
     /// 目录监听线程与窗口消息之间的刷新合并信号。
     pub refresh_signal: RefreshSignal,
+    pub pending_outgoing: PendingOutgoing,
     /// 已渲染 DIB 缓存:ULW 整幅提交的源(内容不保留,必须自己存)
     cache: Option<RenderCache>,
     pub valid: bool,
@@ -213,8 +303,29 @@ impl Fence {
             drag_idx: None,
             drag_down: (0, 0),
             refresh_signal: RefreshSignal::default(),
+            pending_outgoing: PendingOutgoing::default(),
             cache: None,
             valid: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_outgoing_tests {
+    use super::PendingOutgoing;
+    use std::path::PathBuf;
+
+    #[test]
+    fn stale_lease_cannot_clear_a_newer_operation_for_the_same_path() {
+        let pending = PendingOutgoing::default();
+        let path = PathBuf::from(r"C:\test\moving.txt");
+        let first = pending.begin(path.clone());
+        let second = pending.begin(path.clone());
+
+        drop(first);
+        assert!(pending.snapshot().contains(&path));
+
+        drop(second);
+        assert!(!pending.snapshot().contains(&path));
     }
 }
