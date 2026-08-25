@@ -468,15 +468,18 @@ fn dispatch_menu(cmd: u32) {
             });
         }
         MENU_GHOST => {
-            with_global(|g| {
+            let hwnds = with_global(|g| {
                 g.config.ghost_mode = !g.config.ghost_mode;
                 config::save(&g.config);
-                for f in g.fences.iter() {
-                    if f.valid {
-                        fence::schedule_render(f.hwnd);
-                    }
-                }
+                g.fences
+                    .iter()
+                    .filter(|f| f.valid)
+                    .map(|f| f.hwnd)
+                    .collect::<Vec<_>>()
             });
+            for hwnd in hwnds {
+                fence::schedule_render(hwnd);
+            }
         }
         MENU_SWEEP => {
             command::post(AppCommand::SweepDesktop);
