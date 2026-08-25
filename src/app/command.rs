@@ -25,6 +25,9 @@ pub(crate) enum AppCommand {
         right: i32,
         bottom: i32,
     },
+    FenceWindowDestroyed {
+        hwnd: usize,
+    },
 }
 
 #[derive(Default)]
