@@ -253,6 +253,14 @@ pub(crate) fn apply_dpi_change(hwnd: HWND, newdpi: u32, rect: RECT) {
     });
 }
 
+pub(crate) fn apply_window_destroyed(hwnd: HWND) {
+    with_global(|g| {
+        if let Some(idx) = fence_idx(g, hwnd) {
+            g.fences[idx].valid = false;
+        }
+    });
+}
+
 pub fn schedule_render(hwnd: HWND) {
     // 直接渲染(渲染是纯函数,开销毫秒级)
     with_global(|g| {
@@ -336,11 +344,13 @@ unsafe extern "system" fn fence_wndproc(
             return LRESULT(0);
         }
         WM_DESTROY => {
-            with_global(|g| {
-                if let Some(idx) = fence_idx(g, hwnd) {
-                    g.fences[idx].valid = false;
-                }
-            });
+            if crate::global_access_active() {
+                crate::app::command::post(crate::app::command::AppCommand::FenceWindowDestroyed {
+                    hwnd: hwnd.0 as usize,
+                });
+            } else {
+                apply_window_destroyed(hwnd);
+            }
             return LRESULT(0);
         }
         WM_APP_REFRESH => {

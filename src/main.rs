@@ -371,6 +371,9 @@ fn dispatch_app_command(command: AppCommand) {
                 bottom,
             },
         ),
+        AppCommand::FenceWindowDestroyed { hwnd } => {
+            fence::apply_window_destroyed(HWND(hwnd as *mut c_void))
+        }
     }
 }
 
