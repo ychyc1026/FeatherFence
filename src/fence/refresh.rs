@@ -14,12 +14,13 @@ use super::{Entry, Fence};
 pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) {
     let profiling = crate::perf::enabled();
     let total_started = profiling.then(Instant::now);
-    let page = f.page;
+    let page = f.model.page;
     let selected_path = f
+        .model
         .selected
-        .and_then(|i| f.entries.get(i))
+        .and_then(|i| f.model.entries.get(i))
         .map(|e| e.path.clone());
-    f.entries.clear();
+    f.model.entries.clear();
     let dir = f.cfg.folder.clone().unwrap_or_else(|| vault.clone());
     let read_started = profiling.then(Instant::now);
     let read_time;
@@ -31,13 +32,13 @@ pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) {
             let path = e.path();
             let name = e.file_name().to_string_lossy().to_string();
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            f.entries.push(Entry { path, name, is_dir });
+            f.model.entries.push(Entry { path, name, is_dir });
         }
         read_time = read_started
             .map(|started| started.elapsed())
             .unwrap_or_default();
         let sort_started = profiling.then(Instant::now);
-        f.entries.sort_by(|a, b| {
+        f.model.entries.sort_by(|a, b| {
             b.is_dir
                 .cmp(&a.is_dir)
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
@@ -50,15 +51,15 @@ pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) {
             .map(|started| started.elapsed())
             .unwrap_or_default();
     }
-    f.selected = selected_path.and_then(|p| f.entries.iter().position(|e| e.path == p));
-    f.page = page;
+    f.model.selected = selected_path.and_then(|p| f.model.entries.iter().position(|e| e.path == p));
+    f.model.page = page;
     f.wheel_acc = 0;
     sync_page(f);
     if let Some(started) = total_started {
         crate::perf::record_refresh(
             f.cfg.id,
             &dir,
-            f.entries.len(),
+            f.model.entries.len(),
             read_time,
             sort_time,
             started.elapsed(),
@@ -148,16 +149,16 @@ mod refresh_tests {
             ..FenceCfg::default()
         };
         let mut fence = Fence::new(cfg, HWND::default());
-        fence.page = 1;
+        fence.model.page = 1;
         refresh_entries(&mut fence, &dir);
-        assert_eq!(fence.page, 1);
+        assert_eq!(fence.model.page, 1);
         assert_eq!(fence.top_row, grid_dims(&fence).1 as f32);
 
         for entry in std::fs::read_dir(&dir).unwrap().flatten() {
             std::fs::remove_file(entry.path()).unwrap();
         }
         refresh_entries(&mut fence, &dir);
-        assert_eq!(fence.page, 0);
+        assert_eq!(fence.model.page, 0);
         assert_eq!(fence.top_row, 0.0);
 
         std::fs::remove_dir_all(dir).unwrap();
