@@ -353,12 +353,6 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
-/// 把缺少 kind 字段的旧栅栏配置迁移为明确类型。
-pub fn migrate_fence_kinds(c: &mut Config) {
-    let boxes_root = config_dir().join("boxes");
-    migrate_fence_kinds_with_root(c, &boxes_root);
-}
-
 fn migrate_fence_kinds_with_root(c: &mut Config, boxes_root: &Path) {
     for fence in &mut c.fences {
         if fence.kind != FenceKind::Legacy {
@@ -393,25 +387,71 @@ pub fn vault_dir(c: &Config) -> PathBuf {
 }
 
 pub fn load() -> Config {
-    let p = config_path();
-    if let Ok(s) = fs::read_to_string(&p) {
-        if let Ok(mut c) = serde_json::from_str::<Config>(&s) {
-            migrate_fence_kinds(&mut c);
-            return c;
-        }
-    }
-    Config::default()
+    load_from_path(&config_path())
 }
 
 pub fn save(c: &Config) {
-    match serde_json::to_string_pretty(c) {
-        Ok(s) => {
-            if let Err(e) = atomic_write(&config_path(), s.as_bytes()) {
-                eprintln!("[feather] save config failed: {e}");
+    if let Err(e) = save_to_path(c, &config_path()) {
+        eprintln!("[feather] save config failed: {e}");
+    }
+}
+
+fn load_from_path(path: &Path) -> Config {
+    match read_config(path) {
+        Ok((mut config, _)) => {
+            migrate_fence_kinds_with_root(&mut config, &boxes_root_for(path));
+            config
+        }
+        Err(primary_error) => {
+            let backup_path = backup_path_for(path);
+            match read_config(&backup_path) {
+                Ok((mut config, bytes)) => {
+                    eprintln!(
+                        "[feather] primary config unavailable ({primary_error}); recovering from {}",
+                        backup_path.display()
+                    );
+                    if let Err(error) = atomic_write(path, &bytes) {
+                        eprintln!("[feather] restore primary config failed: {error}");
+                    }
+                    migrate_fence_kinds_with_root(&mut config, &boxes_root_for(path));
+                    config
+                }
+                Err(backup_error) => {
+                    if path.exists() || backup_path.exists() {
+                        eprintln!(
+                            "[feather] config recovery failed: primary={primary_error}; backup={backup_error}"
+                        );
+                    }
+                    Config::default()
+                }
             }
         }
-        Err(e) => eprintln!("[feather] serialize config failed: {e}"),
     }
+}
+
+fn save_to_path(config: &Config, path: &Path) -> io::Result<()> {
+    let serialized = serde_json::to_vec_pretty(config).map_err(io::Error::other)?;
+    if let Ok((_, previous)) = read_config(path) {
+        let backup_path = backup_path_for(path);
+        if let Err(error) = atomic_write(&backup_path, &previous) {
+            eprintln!("[feather] backup config failed: {error}");
+        }
+    }
+    atomic_write(path, &serialized)
+}
+
+fn read_config(path: &Path) -> io::Result<(Config, Vec<u8>)> {
+    let bytes = fs::read(path)?;
+    let config = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok((config, bytes))
+}
+
+fn boxes_root_for(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("boxes")
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -451,11 +491,19 @@ fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {
+    sibling_path_with_suffix(path, ".tmp")
+}
+
+fn backup_path_for(path: &Path) -> PathBuf {
+    sibling_path_with_suffix(path, ".bak")
+}
+
+fn sibling_path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut file_name = path
         .file_name()
         .map(OsString::from)
         .unwrap_or_else(|| OsString::from("config.json"));
-    file_name.push(".tmp");
+    file_name.push(suffix);
     path.with_file_name(file_name)
 }
 
@@ -540,6 +588,111 @@ mod persistence_tests {
         );
         assert!(!temp_path_for(&path).exists());
         assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn saving_replaces_backup_only_with_previous_valid_config() {
+        let dir = test_dir();
+        let path = dir.join("config.json");
+        let first = Config {
+            title_font_size: 14,
+            ..Config::default()
+        };
+        let second = Config {
+            title_font_size: 20,
+            ..Config::default()
+        };
+
+        save_to_path(&first, &path).unwrap();
+        save_to_path(&second, &path).unwrap();
+
+        let current = read_config(&path).unwrap().0;
+        let backup = read_config(&backup_path_for(&path)).unwrap().0;
+        assert_eq!(current.title_font_size, 20);
+        assert_eq!(backup.title_font_size, 14);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn saving_over_corrupt_primary_preserves_valid_backup() {
+        let dir = test_dir();
+        let path = dir.join("config.json");
+        let backup_path = backup_path_for(&path);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"broken json").unwrap();
+        let backup = serde_json::to_vec_pretty(&Config {
+            title_font_size: 16,
+            ..Config::default()
+        })
+        .unwrap();
+        fs::write(&backup_path, &backup).unwrap();
+
+        save_to_path(
+            &Config {
+                title_font_size: 22,
+                ..Config::default()
+            },
+            &path,
+        )
+        .unwrap();
+
+        assert_eq!(read_config(&path).unwrap().0.title_font_size, 22);
+        assert_eq!(read_config(&backup_path).unwrap().0.title_font_size, 16);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_primary_recovers_from_backup_and_repairs_primary() {
+        let dir = test_dir();
+        let path = dir.join("config.json");
+        let backup_path = backup_path_for(&path);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"{ incomplete").unwrap();
+        let backup = serde_json::to_vec_pretty(&Config {
+            ghost_mode: true,
+            title_font_size: 17,
+            ..Config::default()
+        })
+        .unwrap();
+        fs::write(&backup_path, backup).unwrap();
+
+        let recovered = load_from_path(&path);
+
+        assert!(recovered.ghost_mode);
+        assert_eq!(recovered.title_font_size, 17);
+        let repaired = read_config(&path).unwrap().0;
+        assert!(repaired.ghost_mode);
+        assert_eq!(repaired.title_font_size, 17);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn valid_primary_wins_over_backup() {
+        let dir = test_dir();
+        let path = dir.join("config.json");
+        let backup_path = backup_path_for(&path);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&Config {
+                title_font_size: 19,
+                ..Config::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            backup_path,
+            serde_json::to_vec_pretty(&Config {
+                title_font_size: 13,
+                ..Config::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(load_from_path(&path).title_font_size, 19);
         fs::remove_dir_all(dir).unwrap();
     }
 }
