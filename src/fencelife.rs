@@ -12,6 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 use crate::config::{self, FenceCfg};
+use crate::desktop::host;
 use crate::desktop_icons;
 use crate::download::download_box_should_show;
 use crate::droptarget;
@@ -299,7 +300,7 @@ pub(crate) fn watchdog_tick(g: &mut Global) {
         // 用 desktop_insert_host(Progman 之后)而非 HWND_BOTTOM ——
         // HWND_BOTTOM 会把窗口压进 Progman 之下的 DWM 隐藏区域(不可见)。
         if f.valid {
-            if let Some(host) = utils::desktop_insert_host() {
+            if let Some(host) = host::desktop_insert_host() {
                 unsafe {
                     let _ = SetWindowPos(
                         f.hwnd,
@@ -328,7 +329,7 @@ pub(crate) fn desktop_layer_tick(g: &mut Global) {
         .desktop_host
         .is_some_and(|h| unsafe { IsWindow(Some(h)).as_bool() });
     if !host_valid {
-        g.desktop_host = utils::find_desktop_host();
+        g.desktop_host = host::find_desktop_host();
     }
     let Some(host) = g.desktop_host else { return };
     let mut anchor = host;
