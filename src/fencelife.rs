@@ -15,9 +15,9 @@ use crate::config::{self, FenceCfg};
 use crate::desktop::avoidance;
 use crate::desktop::host;
 use crate::download::download_box_should_show;
-use crate::droptarget;
 use crate::fence::{self, Fence, WM_APP_DROP};
 use crate::perf;
+use crate::transfer::drop_target;
 use crate::tray;
 use crate::utils::{self, wstr};
 use crate::watcher;
@@ -64,7 +64,7 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
         return 0;
     }
     // 注册拖放
-    let dt = droptarget::FenceDropTarget::new(hwnd);
+    let dt = drop_target::FenceDropTarget::new(hwnd);
     let it: windows::Win32::System::Ole::IDropTarget = dt.into();
     unsafe {
         let _ = RegisterDragDrop(hwnd, &it);
@@ -276,7 +276,7 @@ pub(crate) fn watchdog_tick(g: &mut Global) {
             // 导致窗口可见但点不到拖不动);改为独立顶层窗口 + 压底 Z 序(同 Fluid Fences 思路)
             let hwnd = fence::create_window(&cfg, None);
             if !hwnd.is_invalid() {
-                let dt = droptarget::FenceDropTarget::new(hwnd);
+                let dt = drop_target::FenceDropTarget::new(hwnd);
                 let it: windows::Win32::System::Ole::IDropTarget = dt.into();
                 unsafe {
                     let _ = RegisterDragDrop(hwnd, &it);

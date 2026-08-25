@@ -10,14 +10,13 @@
 mod config;
 mod desktop;
 mod download;
-mod dragout;
-mod droptarget;
 mod fence;
 mod fencelife;
 mod icons;
 mod perf;
 mod shortcut;
 mod sweep;
+mod transfer;
 mod tray;
 mod utils;
 mod watcher;

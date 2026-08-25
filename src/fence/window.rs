@@ -553,7 +553,7 @@ unsafe extern "system" fn fence_wndproc(
             // 在锁外启动 OLE 拖出(阻塞到松手);拖出后文件可能被移动/删除 → 重扫目录刷新
             if let Some((path, vault)) = drag_path {
                 let shortcut_dragout = crate::shortcut::begin_shortcut_dragout(Path::new(&path));
-                crate::dragout::start_drag(vec![path]);
+                crate::transfer::drag_source::start_drag(vec![path]);
                 if shortcut_dragout {
                     crate::shortcut::finish_shortcut_dragout();
                 }
