@@ -29,6 +29,7 @@ impl CommandQueue {
 }
 
 static COMMANDS: OnceLock<Mutex<CommandQueue>> = OnceLock::new();
+static DISPATCH_HWND: OnceLock<usize> = OnceLock::new();
 
 thread_local! {
     static DISPATCHING: Cell<bool> = const { Cell::new(false) };
@@ -58,11 +59,22 @@ fn queue() -> &'static Mutex<CommandQueue> {
     COMMANDS.get_or_init(|| Mutex::new(CommandQueue::default()))
 }
 
-pub(crate) fn post(hwnd: HWND, command: AppCommand) {
+pub(crate) fn init(hwnd: HWND) {
+    DISPATCH_HWND
+        .set(hwnd.0 as usize)
+        .expect("app command dispatcher already initialized");
+}
+
+pub(crate) fn post(command: AppCommand) {
     queue()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push(command);
+    let Some(hwnd) = DISPATCH_HWND.get().copied() else {
+        crate::dlog("[command] dispatcher is not initialized");
+        return;
+    };
+    let hwnd = HWND(hwnd as *mut std::ffi::c_void);
     if unsafe { PostMessageW(Some(hwnd), WM_APP_DISPATCH, WPARAM(0), LPARAM(0)) }.is_err() {
         crate::dlog("[command] failed to post WM_APP_DISPATCH");
     }

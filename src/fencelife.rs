@@ -1,5 +1,4 @@
 // 栅栏生命周期:创建/删除/可见性 + 桌面图标避让编排 + Explorer 重启看门狗 + 拖放处理。
-use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
@@ -159,17 +158,13 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
         .clone()
         .unwrap_or_else(|| config::vault_dir(&g.config));
     let fid = id;
-    let mhwnd = g.msg_hwnd.0 as usize;
     g.fences.push(f);
     // 新栅栏立即落到网格:尺寸/位置吸附 + clamp 工作区 + 消除重叠
     let new_idx = g.fences.len() - 1;
     fence::settle_fence(g, new_idx);
 
     let watcher = watcher::spawn_dir_watcher(watch_dir, move |_names| {
-        crate::app::command::post(
-            HWND(mhwnd as *mut c_void),
-            crate::app::command::AppCommand::RefreshFence { id: fid },
-        );
+        crate::app::command::post(crate::app::command::AppCommand::RefreshFence { id: fid });
     });
     g.watchers.push(ManagedWatcher::fence(fid, watcher));
     sync_config(g);
