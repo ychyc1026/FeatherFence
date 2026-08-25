@@ -426,9 +426,9 @@ pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>, copy_requested: bool) 
                 continue;
             }
             let operation = if copy_requested {
-                watcher::copy_to_dir(&src, &target)
+                crate::transfer::file_ops::copy_to_dir(&src, &target)
             } else {
-                watcher::move_to_dir(&src, &target)
+                crate::transfer::file_ops::move_to_dir(&src, &target)
             };
             match operation {
                 Ok(_) => succeeded += 1,

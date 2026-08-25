@@ -6,7 +6,6 @@ use crate::config::{self, FenceCfg, FenceKind};
 use crate::fence;
 use crate::fencelife::{apply_visibility, create_fence, reserve_desktop_icons, sync_config};
 use crate::utils;
-use crate::watcher;
 
 use super::FileCandidate;
 
@@ -177,7 +176,8 @@ pub(crate) fn download_tick(g: &mut Global) {
             state.stable_ticks = 0;
         }
         // 连续约两秒无尺寸/时间变化后再移动，避免截断仍在写入的浏览器下载。
-        if state.stable_ticks >= 2 && watcher::move_to_dir(path, &target).is_ok() {
+        if state.stable_ticks >= 2 && crate::transfer::file_ops::move_to_dir(path, &target).is_ok()
+        {
             completed.push(path.clone());
         }
     }
