@@ -374,7 +374,7 @@ pub fn start_perf_animation(f: &mut Fence) -> bool {
         return false;
     }
     f.perf_anim_remaining = crate::perf::animation_repeats().saturating_sub(1);
-    f.page = 1;
+    f.model.page = 1;
     start_page_anim(f);
     step_page_anim(f);
     true
@@ -385,7 +385,7 @@ pub(crate) fn continue_perf_animation(f: &mut Fence) -> bool {
         return false;
     }
     f.perf_anim_remaining -= 1;
-    f.page = usize::from(f.page == 0);
+    f.model.page = usize::from(f.model.page == 0);
     start_page_anim(f);
     true
 }
@@ -408,7 +408,7 @@ fn paint_core(
     let mut sample = crate::perf::RenderSample {
         width: w,
         height: h,
-        entries: f.entries.len(),
+        entries: f.model.entries.len(),
         ..Default::default()
     };
     if profiling {
@@ -507,7 +507,7 @@ fn paint_core(
         let mut icons_to_draw: Vec<(i32, i32, HICON)> = Vec::new();
         // 图标 GDI 裁剪区用到的行数(网格块内的 rows 出块即失效,提到函数级)
         let mut grid_rows: i32 = 0;
-        if !f.entries.is_empty() {
+        if !f.model.entries.is_empty() {
             let (cols, rows) = grid_dims(f);
             grid_rows = rows;
             if rows > 0 {
@@ -568,12 +568,12 @@ fn paint_core(
                     }
                     for col in 0..cols {
                         let idx2 = (row * cols + col) as usize;
-                        if idx2 >= f.entries.len() {
+                        if idx2 >= f.model.entries.len() {
                             break;
                         }
-                        let e = &f.entries[idx2];
+                        let e = &f.model.entries[idx2];
                         let x = margin(d) as f32 + col as f32 * cell_w;
-                        if f.selected == Some(idx2) || f.hover == Some(idx2) {
+                        if f.model.selected == Some(idx2) || f.hover == Some(idx2) {
                             fill_rounded(
                                 gfx,
                                 x - 3.0,
@@ -581,7 +581,7 @@ fn paint_core(
                                 cell_w + 6.0,
                                 (icon(f) + label_h(d)) as f32 + 4.0,
                                 8.0,
-                                if f.selected == Some(idx2) {
+                                if f.model.selected == Some(idx2) {
                                     0x55FFFFFF
                                 } else {
                                     0x22FFFFFF
@@ -630,7 +630,7 @@ fn paint_core(
                 GdipDeleteBrush(label_brush as *mut GpBrush);
                 GdipDeleteBrush(shadow_brush as *mut GpBrush);
             }
-        } else if f.entries.is_empty() {
+        } else if f.model.entries.is_empty() {
             // 空栅栏提示
             let hint = if f.cfg.folder.is_some() {
                 "空文件夹"

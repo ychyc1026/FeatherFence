@@ -34,7 +34,7 @@ pub(crate) fn total_pages(f: &Fence) -> usize {
     if ps == 0 {
         return 1;
     }
-    ((f.entries.len() + ps - 1) / ps).max(1)
+    ((f.model.entries.len() + ps - 1) / ps).max(1)
 }
 
 /// 翻页动画计时器 ID
@@ -42,11 +42,11 @@ pub(crate) const ANIM_TICK: usize = 0xFE10;
 /// 页号收敛到合法范围,顶部行吸附到页首(尺寸/条目变化后调用)
 pub(crate) fn sync_page(f: &mut Fence) {
     let pages = total_pages(f);
-    if f.page >= pages {
-        f.page = pages.saturating_sub(1);
+    if f.model.page >= pages {
+        f.model.page = pages.saturating_sub(1);
     }
     let (_, rows) = grid_dims(f);
-    f.top_row = f.page as f32 * rows as f32;
+    f.top_row = f.model.page as f32 * rows as f32;
     stop_page_anim(f);
 }
 
@@ -87,7 +87,7 @@ pub(crate) fn start_page_anim(f: &mut Fence) {
 /// 起步快、落点稳)。到点吸附并停表。返回是否仍在动画中。
 pub(crate) fn step_page_anim(f: &mut Fence) -> bool {
     let (_, rows) = grid_dims(f);
-    let target = f.page as f32 * rows as f32;
+    let target = f.model.page as f32 * rows as f32;
     let t = animation_progress(f.anim_started.elapsed());
     let e = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
     f.top_row = f.anim_from + (target - f.anim_from) * e;
@@ -239,7 +239,7 @@ pub fn config_snapshot(fences: &[Fence]) -> Vec<FenceCfg> {
 }
 
 pub(crate) fn hit_item(f: &Fence, x: i32, y: i32, cols: i32) -> Option<usize> {
-    if f.entries.is_empty() {
+    if f.model.entries.is_empty() {
         return None;
     }
     let d = f.dpi;
@@ -254,7 +254,7 @@ pub(crate) fn hit_item(f: &Fence, x: i32, y: i32, cols: i32) -> Option<usize> {
     // 屏幕行 → 绝对行(加上当前页顶部行,动画中取最近的整数行)
     let row_abs = (row + f.top_row.round() as i32) as i64;
     let idx = row_abs * cols as i64 + col as i64;
-    if idx >= 0 && (idx as usize) < f.entries.len() {
+    if idx >= 0 && (idx as usize) < f.model.entries.len() {
         Some(idx as usize)
     } else {
         None

@@ -9,11 +9,11 @@
 mod geometry;
 mod grid;
 mod menu;
+mod model;
 mod refresh;
 mod render;
 mod window;
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,7 @@ use render::RenderCache;
 // 对外 API 重导出:保持 crate::fence::X 全部调用点不变
 pub use geometry::{dpi_scale, min_h, min_w, set_icon_px, set_title_font_px, window_dpi};
 pub use grid::{config_snapshot, settle_fence};
+pub use model::{Entry, FenceModel};
 pub use refresh::refresh_entries;
 pub use render::{render_fence, start_perf_animation};
 pub use window::{create_window, register_class, schedule_render};
@@ -39,13 +40,6 @@ pub const WM_APP_DROP: u32 = WM_APP + 2;
 pub const WM_APP_REFRESH_ID: u32 = WM_APP + 6;
 /// “显示桌面”会尝试最小化所有独立顶层窗口；异步恢复可避免在 WM_SIZE 内递归。
 pub const WM_APP_DESKTOP_RESTORE: u32 = WM_APP + 20;
-
-#[derive(Clone)]
-pub struct Entry {
-    pub path: PathBuf,
-    pub name: String,
-    pub is_dir: bool,
-}
 
 struct RefreshState {
     queued: bool,
@@ -154,9 +148,8 @@ pub struct Fence {
     pub hwnd: HWND,
     /// 所在显示器的 DPI 缩放因子(Per-Monitor)。窗口跨屏/缩放变化时由 WM_DPICHANGED 更新。
     pub dpi: f32,
-    pub entries: Vec<Entry>,
-    /// 当前页(0 基);滚动按整页切换
-    pub page: usize,
+    /// 不依赖 Win32 的条目、分页和选择状态。
+    pub model: FenceModel,
     /// 网格顶部行号(浮点):翻页动画中平滑变化,静止时 = page × rows
     pub top_row: f32,
     /// 翻页动画计时器是否在跑
@@ -168,8 +161,6 @@ pub struct Fence {
     /// 滚轮增量累加器(1/120 刻度):触控板/高精度滚轮的小增量先累积,满 120 再翻页
     pub wheel_acc: i32,
     pub hover: Option<usize>,
-    /// 单击选中的条目；Delete 键对它执行移入回收站。
-    pub selected: Option<usize>,
     pub moving: bool,
     pub move_off: (i32, i32),
     pub resizing: Option<ResizeDir>,
@@ -193,8 +184,7 @@ impl Fence {
             cfg,
             hwnd,
             dpi: window_dpi(hwnd),
-            entries: Vec::new(),
-            page: 0,
+            model: FenceModel::default(),
             top_row: 0.0,
             animating: false,
             anim_started: Instant::now(),
@@ -202,7 +192,6 @@ impl Fence {
             perf_anim_remaining: 0,
             wheel_acc: 0,
             hover: None,
-            selected: None,
             moving: false,
             move_off: (0, 0),
             resizing: None,

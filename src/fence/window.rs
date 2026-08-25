@@ -334,8 +334,9 @@ unsafe extern "system" fn fence_wndproc(
             let path = with_global(|g| {
                 let idx = fence_idx(g, hwnd)?;
                 let f = &g.fences[idx];
-                f.selected
-                    .and_then(|i| f.entries.get(i))
+                f.model
+                    .selected
+                    .and_then(|i| f.model.entries.get(i))
                     .map(|e| e.path.clone())
             });
             if let Some(path) = path {
@@ -344,7 +345,7 @@ unsafe extern "system" fn fence_wndproc(
                         if let Some(idx) = fence_idx(g, hwnd) {
                             let ghost = g.config.ghost_mode;
                             let f = &mut g.fences[idx];
-                            f.selected = None;
+                            f.model.selected = None;
                             refresh_entries(f, &crate::config::vault_dir(&g.config));
                             render_fence(&mut g.icons, ghost, f);
                         }
@@ -517,7 +518,9 @@ unsafe extern "system" fn fence_wndproc(
                                 let didx = f.drag_idx.take();
                                 f.hover = None;
                                 if let Some(didx) = didx {
-                                    if let Some(p) = f.entries.get(didx).map(|e| e.path.clone()) {
+                                    if let Some(p) =
+                                        f.model.entries.get(didx).map(|e| e.path.clone())
+                                    {
                                         unsafe {
                                             let _ = ReleaseCapture();
                                         };
@@ -552,11 +555,11 @@ unsafe extern "system" fn fence_wndproc(
                 with_global(|g| {
                     if let Some(idx) = fence_idx(g, hwnd) {
                         let f = &mut g.fences[idx];
-                        let keep_page = f.page;
+                        let keep_page = f.model.page;
                         refresh_entries(f, &vault);
                         // 拖出后尽量留在原页(条目减少时收敛到最后一页)
-                        f.page = keep_page.min(total_pages(f).saturating_sub(1));
-                        f.top_row = f.page as f32 * grid_dims(f).1 as f32;
+                        f.model.page = keep_page.min(total_pages(f).saturating_sub(1));
+                        f.top_row = f.model.page as f32 * grid_dims(f).1 as f32;
                         render_fence(&mut g.icons, g.config.ghost_mode, f);
                     }
                 });
@@ -597,12 +600,12 @@ unsafe extern "system" fn fence_wndproc(
                         // 按在图标上:记录潜在拖出,移动超阈值后由 WM_MOUSEMOVE 启动 OLE 拖拽
                         let (cols, _) = grid_dims(f);
                         if let Some(idx2) = hit_item(f, x, y, cols) {
-                            f.selected = Some(idx2);
+                            f.model.selected = Some(idx2);
                             f.drag_idx = Some(idx2);
                             f.drag_down = (x, y);
                             SetCapture(hwnd);
                             render_fence(&mut g.icons, ghost, f);
-                        } else if f.selected.take().is_some() {
+                        } else if f.model.selected.take().is_some() {
                             render_fence(&mut g.icons, ghost, f);
                         }
                     }
@@ -647,7 +650,7 @@ unsafe extern "system" fn fence_wndproc(
                     let f = &mut g.fences[idx];
                     let (cols, _) = grid_dims(f);
                     if let Some(idx2) = hit_item(f, x, y, cols) {
-                        if let Some(e) = f.entries.get(idx2) {
+                        if let Some(e) = f.model.entries.get(idx2) {
                             let w = wstr(&e.path.to_string_lossy());
                             let _ = ShellExecuteW(
                                 None,
@@ -687,10 +690,10 @@ unsafe extern "system" fn fence_wndproc(
                     f.wheel_acc -= steps * 120;
                     let pages = total_pages(f);
                     let dir = if steps < 0 { 1 } else { -1 };
-                    let np =
-                        (f.page as i32 + dir * steps.abs()).clamp(0, pages as i32 - 1) as usize;
-                    if np != f.page {
-                        f.page = np;
+                    let np = (f.model.page as i32 + dir * steps.abs()).clamp(0, pages as i32 - 1)
+                        as usize;
+                    if np != f.model.page {
+                        f.model.page = np;
                         start_page_anim(f);
                         // 立即推进一帧,滚动响应更跟手(剩余动画由 WM_TIMER 平滑补完)
                         step_page_anim(f);
