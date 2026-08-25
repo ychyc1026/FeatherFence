@@ -46,9 +46,6 @@ pub(crate) struct RenderCache {
     h: i32,
 }
 
-// Fence 已手动标注 Send(HWND 等裸句柄);RenderCache 随 Fence 走,同样仅主线程访问
-unsafe impl Send for RenderCache {}
-
 /// 取/建栅栏的渲染缓存(尺寸匹配则复用,否则重建)。返回像素指针;失败返回 null。
 fn ensure_cache(f: &mut Fence, w: i32, h: i32) -> *mut u8 {
     let need_new = match &f.cache {

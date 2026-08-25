@@ -22,11 +22,12 @@ mod tray;
 mod utils;
 mod watcher;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT,
@@ -67,8 +68,6 @@ use download::*;
 use fencelife::*;
 use shortcut::*;
 use sweep::*;
-
-unsafe impl Send for Global {}
 
 pub struct Global {
     pub config: Config,
@@ -134,12 +133,10 @@ struct CollectionStats {
     files: u64,
 }
 
-static G: OnceLock<Mutex<Global>> = OnceLock::new();
-static G_PTR: OnceLock<usize> = OnceLock::new();
 static HINSTANCE: OnceLock<usize> = OnceLock::new();
 
 thread_local! {
-    static G_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static G: RefCell<Option<Global>> = const { RefCell::new(None) };
 }
 
 /// 调试日志:写 %APPDATA%eather-fences\debug.log + stderr
@@ -164,29 +161,19 @@ pub fn hinstance() -> windows::Win32::Foundation::HINSTANCE {
     windows::Win32::Foundation::HINSTANCE(ptr as *mut c_void)
 }
 
-/// 可重入全局访问:模态调用(TrackPopupMenu/DestroyWindow/文件夹对话框)会在持锁时
-/// 派发窗口消息 → 再次进入本函数。深度>0 时直接走裸指针(仅主线程可达,安全)。
+/// UI 线程上的全局状态访问。可能同步派发窗口消息的操作必须先退出本函数，
+/// 或通过 AppCommand 排队；意外的同步重入会立即暴露，避免产生多个 `&mut Global`。
 pub fn with_global<R>(f: impl FnOnce(&mut Global) -> R) -> R {
-    let depth = G_DEPTH.with(|d| {
-        let v = d.get();
-        d.set(v + 1);
-        v
-    });
-    let result = if depth == 0 {
-        let mut guard = G.get().expect("global not init").lock().unwrap();
-        f(&mut guard)
-    } else {
-        unsafe {
-            let ptr = *G_PTR.get().expect("global ptr not set") as *mut Global;
-            f(&mut *ptr)
-        }
-    };
-    G_DEPTH.with(|d| d.set(depth));
-    result
+    G.with(|state| {
+        let mut state = state
+            .try_borrow_mut()
+            .expect("reentrant Global access must be queued as AppCommand");
+        f(state.as_mut().expect("global not init"))
+    })
 }
 
 pub(crate) fn global_access_active() -> bool {
-    G_DEPTH.with(|depth| depth.get() > 0)
+    G.with(|state| state.try_borrow_mut().is_err())
 }
 
 fn desktop_dir() -> Option<PathBuf> {
@@ -707,30 +694,30 @@ fn main() {
         .map(|rd| rd.flatten().map(|e| e.path()).collect())
         .unwrap_or_default();
 
-    G.set(Mutex::new(Global {
-        config: cfg.clone(),
-        next_id: cfg.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1,
-        fences: Vec::new(),
-        msg_hwnd,
-        zen: false,
-        desktop_host: None,
-        icons: icons::IconCache::new(),
-        sweep_retry: Vec::new(),
-        desktop_rx,
-        shortcut_seen,
-        shortcut_pending: HashMap::new(),
-        shortcut_dragout: None,
-        download_rx,
-        download_seen,
-        download_pending: HashMap::new(),
-        exiting: false,
-        droptargets: Vec::new(),
-        watchers: Vec::new(),
-    }))
-    .ok();
-    G_PTR
-        .set(&*G.get().expect("global").lock().unwrap() as *const Global as usize)
-        .ok();
+    G.with(|state| {
+        let mut state = state.borrow_mut();
+        assert!(state.is_none(), "global already initialized");
+        *state = Some(Global {
+            config: cfg.clone(),
+            next_id: cfg.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1,
+            fences: Vec::new(),
+            msg_hwnd,
+            zen: false,
+            desktop_host: None,
+            icons: icons::IconCache::new(),
+            sweep_retry: Vec::new(),
+            desktop_rx,
+            shortcut_seen,
+            shortcut_pending: HashMap::new(),
+            shortcut_dragout: None,
+            download_rx,
+            download_seen,
+            download_pending: HashMap::new(),
+            exiting: false,
+            droptargets: Vec::new(),
+            watchers: Vec::new(),
+        });
+    });
 
     // 托盘
     let ticon = make_tray_icon();
@@ -913,6 +900,9 @@ fn main() {
             }
         }
     });
+    // Global 中的 OLE/GDI 资源必须在对应子系统关闭前析构。
+    let global = G.with(|state| state.borrow_mut().take());
+    drop(global);
     unsafe {
         remove_tray(msg_hwnd);
         let _ = DestroyWindow(msg_hwnd);

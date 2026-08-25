@@ -19,8 +19,6 @@ use crate::utils::wstr;
 
 const CACHE_CAP: usize = 512;
 
-unsafe impl Send for IconCache {}
-
 pub struct IconCache {
     map: HashMap<PathBuf, HICON>,
     lru: VecDeque<PathBuf>,
