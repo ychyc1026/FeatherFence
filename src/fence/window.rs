@@ -219,6 +219,40 @@ pub(crate) fn apply_pointer_cancellation(hwnd: HWND, capture_changed: bool) {
     });
 }
 
+pub(crate) fn apply_dpi_change(hwnd: HWND, newdpi: u32, rect: RECT) {
+    if newdpi == 0 {
+        return;
+    }
+    with_global(|g| {
+        if let Some(idx) = fence_idx(g, hwnd) {
+            let nw = (rect.right - rect.left).max(1);
+            let nh = (rect.bottom - rect.top).max(1);
+            let f = &mut g.fences[idx];
+            f.dpi = newdpi as f32 / 96.0;
+            f.cfg.x = rect.left;
+            f.cfg.y = rect.top;
+            f.cfg.w = nw;
+            f.cfg.h = nh;
+            f.cfg.dpi = newdpi;
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    rect.left,
+                    rect.top,
+                    nw,
+                    nh,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            sync_page(f);
+            render_fence(&mut g.icons, g.config.ghost_mode, f);
+            g.config.fences = config_snapshot(&g.fences);
+            crate::config::save(&g.config);
+        }
+    });
+}
+
 pub fn schedule_render(hwnd: HWND) {
     // 直接渲染(渲染是纯函数,开销毫秒级)
     with_global(|g| {
@@ -798,39 +832,23 @@ unsafe extern "system" fn fence_wndproc(
             // Per-Monitor V2 下,窗口被拖到不同 DPI 的显示器 / 系统缩放变化时,
             // 系统把窗口矩形缩放到建议矩形(并钳进新显示器工作区)。
             // 按建议矩形应用,并把 f.dpi 切到新值 → 几何/渲染随新屏比例重算。
-            with_global(|g| {
-                if let Some(idx) = fence_idx(g, hwnd) {
-                    let newdpi = (wparam.0 & 0xFFFF) as u32;
-                    if newdpi == 0 {
-                        return;
-                    }
-                    let rect = unsafe { *(lparam.0 as *const RECT) };
-                    let nw = (rect.right - rect.left).max(1);
-                    let nh = (rect.bottom - rect.top).max(1);
-                    let f = &mut g.fences[idx];
-                    f.dpi = newdpi as f32 / 96.0;
-                    f.cfg.x = rect.left;
-                    f.cfg.y = rect.top;
-                    f.cfg.w = nw;
-                    f.cfg.h = nh;
-                    f.cfg.dpi = newdpi;
-                    unsafe {
-                        let _ = SetWindowPos(
-                            hwnd,
-                            None,
-                            rect.left,
-                            rect.top,
-                            nw,
-                            nh,
-                            SWP_NOZORDER | SWP_NOACTIVATE,
-                        );
-                    }
-                    sync_page(f);
-                    render_fence(&mut g.icons, g.config.ghost_mode, f);
-                    g.config.fences = config_snapshot(&g.fences);
-                    crate::config::save(&g.config);
-                }
-            });
+            let newdpi = (wparam.0 & 0xFFFF) as u32;
+            if newdpi == 0 {
+                return LRESULT(0);
+            }
+            let rect = unsafe { *(lparam.0 as *const RECT) };
+            if crate::global_access_active() {
+                crate::app::command::post(crate::app::command::AppCommand::ApplyFenceDpiChange {
+                    hwnd: hwnd.0 as usize,
+                    dpi: newdpi,
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                });
+            } else {
+                apply_dpi_change(hwnd, newdpi, rect);
+            }
             return LRESULT(0);
         }
         WM_DISPLAYCHANGE => {
