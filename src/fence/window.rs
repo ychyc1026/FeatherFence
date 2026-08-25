@@ -127,8 +127,7 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
             let _ = ShowWindow(hwnd, SW_SHOWNA);
             // 圆角由 DWM 裁
             enable_round(hwnd);
-            // 首帧渲染(画进缓存 + ULW 提交)
-            schedule_render(hwnd);
+            // Fence 尚未注册到 AppState；首帧由 create_fence 完成状态注册后提交。
             // 自检:程序自己测命中(对比外部诊断,区分桌面/进程视角问题)
             let mut rc = RECT::default();
             let _ = GetWindowRect(hwnd, &mut rc);
