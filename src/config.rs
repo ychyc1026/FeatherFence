@@ -1,7 +1,15 @@
 // 配置:JSON 持久化,位于 %APPDATA%\feather-fences\config.json
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use windows::Win32::Storage::FileSystem::{
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+};
+use windows::core::PCWSTR;
+
+use crate::utils::wstr;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -396,18 +404,59 @@ pub fn load() -> Config {
 }
 
 pub fn save(c: &Config) {
-    if let Err(e) = fs::create_dir_all(config_dir()) {
-        eprintln!("[feather] mkdir config dir failed: {e}");
-        return;
-    }
     match serde_json::to_string_pretty(c) {
         Ok(s) => {
-            if let Err(e) = fs::write(config_path(), s) {
+            if let Err(e) = atomic_write(&config_path(), s.as_bytes()) {
                 eprintln!("[feather] save config failed: {e}");
             }
         }
         Err(e) => eprintln!("[feather] serialize config failed: {e}"),
     }
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let temp_path = temp_path_for(path);
+    let result = (|| {
+        let mut temp = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)?;
+        temp.write_all(contents)?;
+        temp.sync_all()?;
+        drop(temp);
+
+        let from = wstr(&temp_path.to_string_lossy());
+        let to = wstr(&path.to_string_lossy());
+        unsafe {
+            MoveFileExW(
+                PCWSTR(from.as_ptr()),
+                PCWSTR(to.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(|error| io::Error::other(error.to_string()))
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("config.json"));
+    file_name.push(".tmp");
+    path.with_file_name(file_name)
 }
 
 /// 确保目标目录存在,返回是否成功
@@ -416,4 +465,81 @@ pub fn ensure_dir(p: &Path) -> bool {
         return p.is_dir();
     }
     fs::create_dir_all(p).is_ok()
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn test_dir() -> PathBuf {
+        let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "feather-fences-config-test-{}-{id}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn atomic_write_creates_parent_and_complete_json() {
+        let dir = test_dir();
+        let path = dir.join("nested").join("config.json");
+        let config = Config {
+            ghost_mode: true,
+            fences: vec![FenceCfg {
+                id: 7,
+                title: "测试栅栏".into(),
+                ..FenceCfg::default()
+            }],
+            ..Config::default()
+        };
+        let serialized = serde_json::to_string_pretty(&config).unwrap();
+
+        atomic_write(&path, serialized.as_bytes()).unwrap();
+
+        let saved: Config = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved.ghost_mode);
+        assert_eq!(saved.fences[0].title, "测试栅栏");
+        assert!(!temp_path_for(&path).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_config_without_leaving_temp_file() {
+        let dir = test_dir();
+        let path = dir.join("config.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, br#"{"version":1}"#).unwrap();
+        let replacement = serde_json::to_vec_pretty(&Config {
+            title_font_size: 18,
+            ..Config::default()
+        })
+        .unwrap();
+
+        atomic_write(&path, &replacement).unwrap();
+
+        let saved: Config = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.title_font_size, 18);
+        assert!(!temp_path_for(&path).exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_replace_keeps_destination_and_cleans_temp_file() {
+        let dir = test_dir();
+        let path = dir.join("config.json");
+        fs::create_dir_all(&path).unwrap();
+
+        let error = atomic_write(&path, b"replacement").unwrap_err();
+
+        assert!(
+            path.is_dir(),
+            "failed replacement must keep its destination"
+        );
+        assert!(!temp_path_for(&path).exists());
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
