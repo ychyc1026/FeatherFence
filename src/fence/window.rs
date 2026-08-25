@@ -112,7 +112,7 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
             // 窗口不可见且 FindWindow/EnumWindows 都枚举不到。
             // 不挂 Progman 作父窗口(分层窗口+高 alpha+Progman 父窗口会触发 DWM
             // 命中测试 bug,导致窗口可见但点不到拖不动)。
-            if let Some(host) = crate::utils::desktop_insert_host() {
+            if let Some(host) = crate::desktop::host::desktop_insert_host() {
                 let _ = SetWindowPos(
                     hwnd,
                     Some(host),

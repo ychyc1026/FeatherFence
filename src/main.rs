@@ -8,6 +8,7 @@
 // 轻栅栏 feather-fences:超轻量桌面分区整理工具
 // Rust + Win32 原生实现,Fences 轻量版(GPL-3.0,受 Fluid Fences 概念启发,代码为原创)
 mod config;
+mod desktop;
 mod desktop_icons;
 mod download;
 mod dragout;

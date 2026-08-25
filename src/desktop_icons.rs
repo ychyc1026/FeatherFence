@@ -50,7 +50,7 @@ pub fn reserve(reserved_screen: &[RECT]) {
     if reserved_screen.is_empty() {
         return;
     }
-    let Some(list) = crate::utils::find_desktop_listview() else {
+    let Some(list) = crate::desktop::host::find_desktop_listview() else {
         return;
     };
     unsafe {
@@ -223,7 +223,7 @@ pub fn record_fence(cfg: &crate::config::FenceCfg) {
 
 /// 撤销图标搬移:把存活期内被搬走的图标写回原位。返回成功写回的数量。
 pub fn rollback_icons() -> usize {
-    let Some(list) = crate::utils::find_desktop_listview() else {
+    let Some(list) = crate::desktop::host::find_desktop_listview() else {
         clear_history();
         return 0;
     };
@@ -286,7 +286,7 @@ pub fn clear_history() {
 /// (只当避让开启时由我们关掉自动排列才重新打开;用户原本手动关掉的
 /// 自定义布局保持原样,不被强制吸附)。图标位置不做任何改动。
 pub fn restore_autoarrange() {
-    let Some(list) = crate::utils::find_desktop_listview() else {
+    let Some(list) = crate::desktop::host::find_desktop_listview() else {
         return;
     };
     unsafe {
