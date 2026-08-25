@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 use crate::config::{self, FenceKind};
 use crate::fence;
 use crate::fencelife::reserve_desktop_icons;
-use crate::watcher;
 use crate::{Global, with_global};
 
 use super::{CollectionStats, FileCandidate};
@@ -283,7 +282,7 @@ pub(crate) fn shortcut_tick(g: &mut Global) {
             completed.push(path);
             continue;
         };
-        match watcher::move_to_dir(&path, &target) {
+        match crate::transfer::file_ops::move_to_dir(&path, &target) {
             Ok(_) => {
                 completed.push(path);
                 moved_to.insert(id);
