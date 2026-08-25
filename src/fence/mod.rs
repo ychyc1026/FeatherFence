@@ -129,8 +129,6 @@ impl RefreshSignal {
     }
 }
 
-unsafe impl Send for Fence {}
-
 pub struct Fence {
     pub cfg: FenceCfg,
     pub hwnd: HWND,
