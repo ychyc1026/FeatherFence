@@ -1,13 +1,12 @@
-
 // 下载接管:浏览器下载归入专用收纳箱(独立 Downloads 监听 + 尺寸/时间稳定判定)。
 use std::path::{Path, PathBuf};
 
+use crate::Global;
 use crate::config::{self, FenceCfg, FenceKind};
 use crate::fence;
 use crate::fencelife::{apply_visibility, create_fence, reserve_desktop_icons, sync_config};
 use crate::utils;
 use crate::watcher;
-use crate::Global;
 
 use super::FileCandidate;
 
@@ -68,8 +67,7 @@ pub(crate) fn download_box_should_show(g: &Global, id: u32) -> bool {
 }
 
 pub(crate) fn downloads_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .map(|p| PathBuf::from(p).join("Downloads"))
+    std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Downloads"))
 }
 
 fn reset_download_tracking(g: &mut Global) {
@@ -106,25 +104,37 @@ pub(crate) fn set_download_box_visible(g: &mut Global, visible: bool) {
 }
 fn is_download_temp(path: &Path) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
         Some("crdownload" | "part" | "partial" | "download" | "tmp")
     )
 }
 
 pub(crate) fn ingest_desktop_events(g: &mut Global) {
-    let Some(downloads) = downloads_dir() else { return };
+    let Some(downloads) = downloads_dir() else {
+        return;
+    };
     while let Ok(names) = g.download_rx.try_recv() {
         for name in names {
             let path = downloads.join(name);
-            if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case("desktop.ini")) {
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("desktop.ini"))
+            {
                 continue;
             }
             if path.is_file() && !is_download_temp(&path) && g.download_seen.insert(path.clone()) {
-                g.download_pending.insert(path, FileCandidate {
-                    len: u64::MAX,
-                    modified: None,
-                    stable_ticks: 0,
-                });
+                g.download_pending.insert(
+                    path,
+                    FileCandidate {
+                        len: u64::MAX,
+                        modified: None,
+                        stable_ticks: 0,
+                    },
+                );
             }
         }
     }

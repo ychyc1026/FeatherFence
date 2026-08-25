@@ -1,13 +1,15 @@
 // 系统工具:DPI、桌面宿主窗口(WorkerW)、宽字符串等
 use std::mem::size_of;
-use windows::core::{w, BOOL};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITOR_DEFAULTTONEAREST, MONITORINFO};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, FindWindowW, GetClassNameW, GetSystemMetrics,
-    SendMessageW, SetProcessDPIAware, SM_CXSCREEN, SM_CYSCREEN,
+    EnumChildWindows, EnumWindows, FindWindowW, GetClassNameW, GetSystemMetrics, SM_CXSCREEN,
+    SM_CYSCREEN, SendMessageW, SetProcessDPIAware,
 };
+use windows::core::{BOOL, w};
 
 /// UTF-8 -> 以 0 结尾的 UTF-16
 pub fn wstr(s: &str) -> Vec<u16> {
@@ -17,7 +19,11 @@ pub fn wstr(s: &str) -> Vec<u16> {
 pub fn set_dpi_awareness() {
     unsafe {
         // 尽力而为:新 API 失败就退回旧 API
-        if SetProcessDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_err() {
+        if SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+        .is_err()
+        {
             let _ = SetProcessDPIAware();
         }
     }

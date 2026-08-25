@@ -1,9 +1,8 @@
-
 // 桌面清扫:扩展名规则把桌面杂项文件搬到目标目录;失败项定时重试。
+use crate::Global;
 use crate::download::ingest_desktop_events;
 use crate::shortcut::ext_of;
 use crate::watcher;
-use crate::Global;
 
 use super::desktop_dir;
 
@@ -16,7 +15,9 @@ pub(crate) fn sweep_desktop(g: &mut Global) {
     if rules.is_empty() {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if !p.is_file() {

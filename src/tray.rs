@@ -1,21 +1,21 @@
 // 系统托盘:图标 + 右键菜单
 use std::mem::{size_of, zeroed};
 
-use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyMenu, PostMessageW,
-    SetForegroundWindow, HICON, ICONINFO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, TrackPopupMenu, TPM_NONOTIFY, TPM_RETURNCMD, WM_NULL,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateCompatibleDC, CreateDIBSection,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, HGDIOBJ,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyMenu, HICON, ICONINFO, MF_CHECKED,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW, SetForegroundWindow,
+    TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, WM_NULL,
+};
+use windows::core::{BOOL, PCWSTR, w};
 
 use crate::utils::wstr;
 
@@ -62,12 +62,19 @@ pub fn make_tray_icon() -> HICON {
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB.0;
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let hbmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
+        let hbmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+            .unwrap_or_default();
         if !bits.is_null() {
             std::ptr::copy_nonoverlapping(px.as_ptr(), bits as *mut u32, 256);
         }
         let zero_mask = [0u8; 32];
-        let mask = CreateBitmap(16, 16, 1, 1, Some(zero_mask.as_ptr() as *const std::ffi::c_void));
+        let mask = CreateBitmap(
+            16,
+            16,
+            1,
+            1,
+            Some(zero_mask.as_ptr() as *const std::ffi::c_void),
+        );
         let ii = ICONINFO {
             fIcon: BOOL(1),
             xHotspot: 0,
@@ -151,56 +158,129 @@ pub fn show_tray_menu(
 ) -> u32 {
     unsafe {
         let menu = CreatePopupMenu().unwrap_or_default();
-        let _ = AppendMenuW(menu, MF_STRING, MENU_NEW_PORTAL as usize, PCWSTR(w!("新建文件夹栅栏…").as_ptr()));
-        let _ = AppendMenuW(menu, MF_STRING, MENU_NEW_BOX as usize, PCWSTR(w!("新建收纳栅栏").as_ptr()));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE_VIS as usize, PCWSTR(w!("隐藏/显示全部栅栏").as_ptr()));
         let _ = AppendMenuW(
             menu,
-            if zen { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
+            MF_STRING,
+            MENU_NEW_PORTAL as usize,
+            PCWSTR(w!("新建文件夹栅栏…").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_NEW_BOX as usize,
+            PCWSTR(w!("新建收纳栅栏").as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_TOGGLE_VIS as usize,
+            PCWSTR(w!("隐藏/显示全部栅栏").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            if zen {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING | MF_UNCHECKED
+            },
             MENU_ZEN as usize,
             PCWSTR(w!("Zen 模式\tCtrl+Alt+Z").as_ptr()),
         );
         let _ = AppendMenuW(
             menu,
-            if ghost { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
+            if ghost {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING | MF_UNCHECKED
+            },
             MENU_GHOST as usize,
             PCWSTR(w!("Ghost 模式(悬停显现)").as_ptr()),
         );
-        let _ = AppendMenuW(menu, MF_STRING, MENU_SWEEP as usize, PCWSTR(w!("立即整理桌面").as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_SWEEP as usize,
+            PCWSTR(w!("立即整理桌面").as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
             menu,
-            if download_enabled { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
+            if download_enabled {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING | MF_UNCHECKED
+            },
             MENU_DOWNLOAD_ENABLED as usize,
             PCWSTR(w!("下载接管").as_ptr()),
         );
-        let visible_flags = if download_visible { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED };
+        let visible_flags = if download_visible {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING | MF_UNCHECKED
+        };
         let _ = AppendMenuW(
             menu,
-            if download_enabled { visible_flags } else { visible_flags | MF_GRAYED },
+            if download_enabled {
+                visible_flags
+            } else {
+                visible_flags | MF_GRAYED
+            },
             MENU_DOWNLOAD_VISIBLE as usize,
             PCWSTR(w!("显示下载收纳箱").as_ptr()),
         );
         let _ = AppendMenuW(
             menu,
-            if desktop_avoid { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
+            if desktop_avoid {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING | MF_UNCHECKED
+            },
             MENU_DESKTOP_AVOID as usize,
             PCWSTR(w!("桌面图标避让").as_ptr()),
         );
-        let _ = AppendMenuW(menu, MF_STRING, MENU_DESKTOP_ROLLBACK as usize, PCWSTR(w!("撤销并关闭避让").as_ptr()));
-        let _ = AppendMenuW(menu, MF_GRAYED, 0, PCWSTR(w!("搬移后 1 分钟内可撤销").as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_DESKTOP_ROLLBACK as usize,
+            PCWSTR(w!("撤销并关闭避让").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_GRAYED,
+            0,
+            PCWSTR(w!("搬移后 1 分钟内可撤销").as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
             menu,
-            if autostart { MF_STRING | MF_CHECKED } else { MF_STRING | MF_UNCHECKED },
+            if autostart {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING | MF_UNCHECKED
+            },
             MENU_AUTOSTART as usize,
             PCWSTR(w!("开机自启").as_ptr()),
         );
-        let _ = AppendMenuW(menu, MF_STRING, MENU_RELOAD as usize, PCWSTR(w!("重新加载配置").as_ptr()));
-        let _ = AppendMenuW(menu, MF_STRING, MENU_CONFIG_DIR as usize, PCWSTR(w!("打开配置目录").as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_RELOAD as usize,
+            PCWSTR(w!("重新加载配置").as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_CONFIG_DIR as usize,
+            PCWSTR(w!("打开配置目录").as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT as usize, PCWSTR(w!("退出").as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_EXIT as usize,
+            PCWSTR(w!("退出").as_ptr()),
+        );
 
         let mut pt = windows::Win32::Foundation::POINT::default();
         let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);

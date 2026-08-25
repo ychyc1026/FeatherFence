@@ -2,37 +2,37 @@
 use std::mem::size_of;
 use std::time::Instant;
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateRectRgn, DeleteDC, DeleteObject, SelectClipRgn,
-    SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    CreateCompatibleDC, CreateDIBSection, CreateRectRgn, DIB_RGB_COLORS, DeleteDC, DeleteObject,
+    HBITMAP, HDC, HGDIOBJ, SelectClipRgn, SelectObject,
 };
 use windows::Win32::Graphics::GdiPlus::{
-    GdipAddPathArc, GdipAddPathEllipse, GdipClosePathFigure, GdipCreateFont,
-    GdipCreateFontFamilyFromName, GdipCreateFromHDC, GdipCreatePath, GdipCreateSolidFill,
-    GdipCreateStringFormat, GdipDeleteBrush, GdipDeleteFont, GdipDeleteFontFamily,
-    GdipDeleteGraphics, GdipDeletePath, GdipDeleteStringFormat, GdipDrawString, GdipFillPath,
-    GdipFillRectangle, GdipFlush, GdipMeasureString, GdipResetClip, GdipSetClipRect,
-    GdipSetSmoothingMode, GdipSetStringFormatAlign, GdipSetStringFormatFlags,
-    GdipSetStringFormatLineAlign, GdipSetStringFormatTrimming, GdipSetTextRenderingHint,
-    CombineModeReplace, FillModeAlternate, FlushIntentionSync, FontStyleRegular, GpBrush, GpFont,
-    GpFontFamily, GpGraphics, GpPath, GpSolidFill, GpStringFormat, RectF, SmoothingModeAntiAlias,
+    CombineModeReplace, FillModeAlternate, FlushIntentionSync, FontStyleRegular, GdipAddPathArc,
+    GdipAddPathEllipse, GdipClosePathFigure, GdipCreateFont, GdipCreateFontFamilyFromName,
+    GdipCreateFromHDC, GdipCreatePath, GdipCreateSolidFill, GdipCreateStringFormat,
+    GdipDeleteBrush, GdipDeleteFont, GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeletePath,
+    GdipDeleteStringFormat, GdipDrawString, GdipFillPath, GdipFillRectangle, GdipFlush,
+    GdipMeasureString, GdipResetClip, GdipSetClipRect, GdipSetSmoothingMode,
+    GdipSetStringFormatAlign, GdipSetStringFormatFlags, GdipSetStringFormatLineAlign,
+    GdipSetStringFormatTrimming, GdipSetTextRenderingHint, GpBrush, GpFont, GpFontFamily,
+    GpGraphics, GpPath, GpSolidFill, GpStringFormat, RectF, SmoothingModeAntiAlias,
     StringAlignmentCenter, StringAlignmentNear, StringFormatFlagsNoWrap,
     StringTrimmingEllipsisCharacter, TextRenderingHintAntiAliasGridFit, UnitPixel,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DrawIconEx, GetWindowRect, HICON, DI_NORMAL, ULW_ALPHA, UpdateLayeredWindow,
+    DI_NORMAL, DrawIconEx, GetWindowRect, HICON, ULW_ALPHA, UpdateLayeredWindow,
 };
+use windows::core::PCWSTR;
 
 use crate::utils::wstr;
 
+use super::Fence;
 use super::geometry::{
-    cell_h, font_label, font_title, icon, label_h, margin, rail, title_h, FONT_NAME,
+    FONT_NAME, cell_h, font_label, font_title, icon, label_h, margin, rail, title_h,
 };
 use super::grid::{grid_dims, start_page_anim, step_page_anim, total_pages};
-use super::Fence;
 
 /// 已渲染的窗口位图缓存(分层窗口的"内容保留"靠它)。每栅栏一个,
 /// 渲染时重画、UpdateLayeredWindow 整幅提交。尺寸变化时重建。
@@ -98,8 +98,14 @@ unsafe fn submit_ulw(hwnd: HWND, cache: &RenderCache) {
     unsafe {
         let mut rc = RECT::default();
         let _ = GetWindowRect(hwnd, &mut rc);
-        let mut pos = POINT { x: rc.left, y: rc.top };
-        let size = SIZE { cx: cache.w, cy: cache.h };
+        let mut pos = POINT {
+            x: rc.left,
+            y: rc.top,
+        };
+        let size = SIZE {
+            cx: cache.w,
+            cy: cache.h,
+        };
         let src = POINT { x: 0, y: 0 };
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
@@ -125,7 +131,15 @@ unsafe fn add_rounded_path(path: *mut GpPath, x: f32, y: f32, w: f32, h: f32, r:
     let r = r.min(w / 2.0).min(h / 2.0);
     GdipAddPathArc(path, x, y, r * 2.0, r * 2.0, 180.0, 90.0);
     GdipAddPathArc(path, x + w - r * 2.0, y, r * 2.0, r * 2.0, 270.0, 90.0);
-    GdipAddPathArc(path, x + w - r * 2.0, y + h - r * 2.0, r * 2.0, r * 2.0, 0.0, 90.0);
+    GdipAddPathArc(
+        path,
+        x + w - r * 2.0,
+        y + h - r * 2.0,
+        r * 2.0,
+        r * 2.0,
+        0.0,
+        90.0,
+    );
     GdipAddPathArc(path, x, y + h - r * 2.0, r * 2.0, r * 2.0, 90.0, 90.0);
     GdipClosePathFigure(path);
 }
@@ -150,15 +164,7 @@ unsafe fn draw_text(
     rect: RectF,
 ) {
     let w = wstr(text);
-    GdipDrawString(
-        g,
-        PCWSTR(w.as_ptr()),
-        -1,
-        font,
-        &rect,
-        fmt,
-        brush,
-    );
+    GdipDrawString(g, PCWSTR(w.as_ptr()), -1, font, &rect, fmt, brush);
 }
 
 /// 绘制桌面图标式标签:先在八个方向各偏移 stroke 画一圈暗色描边,再画白色正文。
@@ -219,7 +225,6 @@ unsafe fn draw_label_line(
     } else {
         draw_outlined_text(g, font, fmt, shadow, white, text, rect, 1.0);
     }
-
 }
 
 /// 文件名称:仿 Windows 桌面图标标签 —— 白色文字 + 紧实深色描边,
@@ -273,8 +278,18 @@ unsafe fn draw_label(
     let line1 = String::from_utf16_lossy(&units[..cut]);
     let line2 = String::from_utf16_lossy(&units[cut..]);
     let half = rect.Height / 2.0;
-    let r1 = RectF { X: rect.X, Y: rect.Y, Width: rect.Width, Height: half };
-    let r2 = RectF { X: rect.X, Y: rect.Y + half, Width: rect.Width, Height: half };
+    let r1 = RectF {
+        X: rect.X,
+        Y: rect.Y,
+        Width: rect.Width,
+        Height: half,
+    };
+    let r2 = RectF {
+        X: rect.X,
+        Y: rect.Y + half,
+        Width: rect.Width,
+        Height: half,
+    };
     unsafe {
         draw_label_line(g, font, fmt, shadow, white, &line1, r1, fast);
         draw_label_line(g, font, fmt, shadow, white, &line2, r2, fast);
@@ -321,7 +336,13 @@ unsafe fn draw_page_dots(g: *mut GpGraphics, f: &Fence, w: i32, h: i32) {
         let col = (a << 24) | 0x00FFFFFF;
         if act > 0.01 {
             // 当前页外圈柔光(白色)
-            fill_circle(g, cx, cy, r * 2.0, (((0x40 as f32) * act) as u32) << 24 | 0x00FFFFFF);
+            fill_circle(
+                g,
+                cx,
+                cy,
+                r * 2.0,
+                (((0x40 as f32) * act) as u32) << 24 | 0x00FFFFFF,
+            );
         }
         fill_circle(g, cx, cy, r, col);
     }
@@ -437,7 +458,11 @@ fn paint_core(
 
         // 标题栏
         let mut fam: *mut GpFontFamily = std::ptr::null_mut();
-        GdipCreateFontFamilyFromName(PCWSTR(wstr(FONT_NAME).as_ptr()), std::ptr::null_mut(), &mut fam);
+        GdipCreateFontFamilyFromName(
+            PCWSTR(wstr(FONT_NAME).as_ptr()),
+            std::ptr::null_mut(),
+            &mut fam,
+        );
         let mut font: *mut GpFont = std::ptr::null_mut();
         GdipCreateFont(fam, font_title(d), FontStyleRegular.0, UnitPixel, &mut font);
         let mut fmt: *mut GpStringFormat = std::ptr::null_mut();
@@ -465,7 +490,14 @@ fn paint_core(
         } else {
             f.cfg.title.clone()
         };
-        draw_text(gfx, font, fmt, title_brush as *const GpBrush, &display_title, title_rect);
+        draw_text(
+            gfx,
+            font,
+            fmt,
+            title_brush as *const GpBrush,
+            &display_title,
+            title_rect,
+        );
 
         // 图标网格
         // 待画的图标(位置 + HICON):GDI DrawIconEx 在 GDI+ 绘制完成后统一直绘。
@@ -483,7 +515,13 @@ fn paint_core(
                 let mut hover_brush: *mut GpSolidFill = std::ptr::null_mut();
                 GdipCreateSolidFill(0x22FFFFFF, &mut hover_brush);
                 let mut label_font: *mut GpFont = std::ptr::null_mut();
-                GdipCreateFont(fam, font_label(d), FontStyleRegular.0, UnitPixel, &mut label_font);
+                GdipCreateFont(
+                    fam,
+                    font_label(d),
+                    FontStyleRegular.0,
+                    UnitPixel,
+                    &mut label_font,
+                );
                 let mut label_fmt: *mut GpStringFormat = std::ptr::null_mut();
                 GdipCreateStringFormat(0, 0, &mut label_fmt);
                 GdipSetStringFormatAlign(label_fmt, StringAlignmentCenter);
@@ -522,7 +560,9 @@ fn paint_core(
                     if row < 0 {
                         continue;
                     }
-                    let y = title_h(d) as f32 + margin(d) as f32 + (row as f32 - f.top_row) * cell_h(f) as f32;
+                    let y = title_h(d) as f32
+                        + margin(d) as f32
+                        + (row as f32 - f.top_row) * cell_h(f) as f32;
                     if y >= h as f32 {
                         break;
                     }
@@ -541,7 +581,11 @@ fn paint_core(
                                 cell_w + 6.0,
                                 (icon(f) + label_h(d)) as f32 + 4.0,
                                 8.0,
-                                if f.selected == Some(idx2) { 0x55FFFFFF } else { 0x22FFFFFF },
+                                if f.selected == Some(idx2) {
+                                    0x55FFFFFF
+                                } else {
+                                    0x22FFFFFF
+                                },
                             );
                         }
                         // 图标:收集位置,稍后由 GDI DrawIconEx 直绘(原生 alpha,透明区正确)
@@ -588,7 +632,11 @@ fn paint_core(
             }
         } else if f.entries.is_empty() {
             // 空栅栏提示
-            let hint = if f.cfg.folder.is_some() { "空文件夹" } else { "将文件拖入此处收纳" };
+            let hint = if f.cfg.folder.is_some() {
+                "空文件夹"
+            } else {
+                "将文件拖入此处收纳"
+            };
             let mut hint_fmt: *mut GpStringFormat = std::ptr::null_mut();
             GdipCreateStringFormat(0, 0, &mut hint_fmt);
             GdipSetStringFormatAlign(hint_fmt, StringAlignmentCenter);
@@ -601,7 +649,14 @@ fn paint_core(
                 Width: (w - 20).max(1) as f32,
                 Height: (h - title_h(d) - 20).max(1) as f32,
             };
-            draw_text(gfx, font, hint_fmt, hint_brush as *const GpBrush, hint, hint_rect);
+            draw_text(
+                gfx,
+                font,
+                hint_fmt,
+                hint_brush as *const GpBrush,
+                hint,
+                hint_rect,
+            );
             GdipDeleteStringFormat(hint_fmt);
             GdipDeleteBrush(hint_brush as *mut GpBrush);
         }

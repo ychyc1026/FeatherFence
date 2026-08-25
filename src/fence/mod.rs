@@ -80,7 +80,7 @@ impl RefreshState {
         if elapsed < delay {
             let remaining = delay - elapsed;
             return RefreshTimerAction::Wait(
-                remaining.as_millis().clamp(1, u32::MAX as u128) as u32,
+                remaining.as_millis().clamp(1, u32::MAX as u128) as u32
             );
         }
         self.queued = false;
@@ -111,9 +111,7 @@ impl RefreshSignal {
         if !should_post {
             return;
         }
-        let posted = unsafe {
-            PostMessageW(Some(hwnd), WM_APP_REFRESH, WPARAM(0), LPARAM(0))
-        };
+        let posted = unsafe { PostMessageW(Some(hwnd), WM_APP_REFRESH, WPARAM(0), LPARAM(0)) };
         if posted.is_err() {
             self.cancel();
         }

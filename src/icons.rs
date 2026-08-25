@@ -6,13 +6,13 @@ use std::collections::{HashMap, VecDeque};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows::Win32::UI::Controls::IImageList;
 use windows::Win32::UI::Shell::{
-    SHGetFileInfoW, SHGetImageList, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
-    SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHIL_EXTRALARGE, SHIL_LARGE,
+    SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES,
+    SHGetFileInfoW, SHGetImageList, SHIL_EXTRALARGE, SHIL_LARGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
-use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows::core::PCWSTR;
 
 use crate::utils::wstr;

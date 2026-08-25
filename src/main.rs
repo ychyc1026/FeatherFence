@@ -1,7 +1,6 @@
 // GUI 子系统:不弹出控制台窗口。日志写 %APPDATA%\feather-fences\debug.log;
 // 从终端 cargo run 启动时输出仍会显示在终端里(继承父进程句柄)。
 #![windows_subsystem = "windows"]
-
 // unsafe_op_in_unsafe_fn:本库以 `unsafe fn` 作为 Win32 FFI 的安全契约(每个调用点都
 // 在 unsafe fn 体内),再逐调用包 unsafe{} 属于重复标注,徒增噪音。函数签名已声明 unsafe。
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -10,53 +9,55 @@
 // Rust + Win32 原生实现,Fences 轻量版(GPL-3.0,受 Fluid Fences 概念启发,代码为原创)
 mod config;
 mod desktop_icons;
+mod download;
 mod dragout;
 mod droptarget;
 mod fence;
+mod fencelife;
 mod icons;
 mod perf;
+mod shortcut;
+mod sweep;
 mod tray;
 mod utils;
 mod watcher;
-mod download;
-mod fencelife;
-mod shortcut;
-mod sweep;
 
-use std::ffi::c_void;
 use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
 
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT,
     SetLastError, WPARAM,
 };
-use windows::Win32::Graphics::GdiPlus::{GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GdiplusStartupOutput};
+use windows::Win32::Graphics::GdiPlus::{
+    GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GdiplusStartupOutput,
+};
 use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_CONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, RegisterHotKey};
 use windows::Win32::UI::Shell::{
-    SHBrowseForFolderW, SHGetKnownFolderPath, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE,
-    BIF_RETURNONLYFSDIRS, BROWSEINFOW, FOLDERID_Desktop, FOLDERID_PublicDesktop, ShellExecuteW,
+    BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, FOLDERID_Desktop,
+    FOLDERID_PublicDesktop, SHBrowseForFolderW, SHGetKnownFolderPath, SHGetPathFromIDListW,
+    ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
-    TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSW,
-    WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
+    PostQuitMessage, RegisterClassW, TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_QUIT,
+    WM_TIMER, WNDCLASSW, WS_POPUP,
 };
+use windows::core::{PCWSTR, w};
 
 use config::{Config, FenceCfg, FenceKind};
 use fence::Fence;
 use tray::{
-    WM_APP_TRAY, MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DESKTOP_AVOID, MENU_DESKTOP_ROLLBACK,
+    MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DESKTOP_AVOID, MENU_DESKTOP_ROLLBACK,
     MENU_DOWNLOAD_ENABLED, MENU_DOWNLOAD_VISIBLE, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX,
-    MENU_NEW_PORTAL, MENU_RELOAD, MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, add_tray,
+    MENU_NEW_PORTAL, MENU_RELOAD, MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, WM_APP_TRAY, add_tray,
     make_tray_icon, remove_tray, show_tray_menu,
 };
 use utils::wstr;
@@ -144,7 +145,11 @@ thread_local! {
 pub fn dlog(msg: &str) {
     use std::io::Write;
     let p = config::config_dir().join("debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+    {
         let _ = writeln!(f, "{}", msg);
     }
     eprintln!("{msg}");
@@ -178,17 +183,6 @@ pub fn with_global<R>(f: impl FnOnce(&mut Global) -> R) -> R {
     G_DEPTH.with(|d| d.set(depth));
     result
 }
-
-
-
-
-
-
-
-
-
-
-
 
 fn desktop_dir() -> Option<PathBuf> {
     known_folder_dir(&FOLDERID_Desktop)
@@ -245,8 +239,8 @@ fn pick_folder(owner: HWND, title: &str) -> Option<PathBuf> {
 // ---------- 开机自启 ----------
 
 fn set_autostart(enabled: bool) {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     let path = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(path, KEY_READ | KEY_WRITE) {
         Ok(key) => {
@@ -455,12 +449,14 @@ fn dispatch_menu(cmd: u32) {
             });
         }
         MENU_SWEEP => {
-            let _ = unsafe { PostMessageW(
-                Some(with_global(|g| g.msg_hwnd)),
-                WM_APP_SWEEP,
-                WPARAM(0),
-                LPARAM(0),
-            ) };
+            let _ = unsafe {
+                PostMessageW(
+                    Some(with_global(|g| g.msg_hwnd)),
+                    WM_APP_SWEEP,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
         }
         MENU_DOWNLOAD_ENABLED => {
             with_global(|g| set_download_enabled(g, !g.config.download_enabled));
@@ -509,7 +505,12 @@ fn dispatch_menu(cmd: u32) {
                 g.watchers
                     .retain(|watcher| watcher.owner == WatcherOwner::Process);
                 // 先销毁全部旧窗口(避免持借用调用 DestroyWindow)
-                let hwnds: Vec<HWND> = g.fences.iter().filter(|f| f.valid).map(|f| f.hwnd).collect();
+                let hwnds: Vec<HWND> = g
+                    .fences
+                    .iter()
+                    .filter(|f| f.valid)
+                    .map(|f| f.hwnd)
+                    .collect();
                 for h in hwnds {
                     unsafe {
                         let _ = windows::Win32::System::Ole::RevokeDragDrop(h);
@@ -548,7 +549,14 @@ fn dispatch_menu(cmd: u32) {
             }
         }
         MENU_EXIT => {
-            unsafe { let _ = PostMessageW(Some(with_global(|g| g.msg_hwnd)), WM_QUIT, WPARAM(0), LPARAM(0)); };
+            unsafe {
+                let _ = PostMessageW(
+                    Some(with_global(|g| g.msg_hwnd)),
+                    WM_QUIT,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            };
         }
         _ => {}
     }
@@ -568,7 +576,8 @@ fn main() {
     unsafe {
         SetLastError(ERROR_SUCCESS);
     }
-    let mutex = unsafe { CreateMutexW(None, false, w!("feather-fences-singleton")).unwrap_or_default() };
+    let mutex =
+        unsafe { CreateMutexW(None, false, w!("feather-fences-singleton")).unwrap_or_default() };
     let last_err = unsafe { GetLastError() };
     dlog(&format!(
         "[main] mutex handle valid={} last_error={} (183=ALREADY_EXISTS)",
@@ -887,7 +896,9 @@ fn main() {
         config::save(&g.config);
         for f in g.fences.iter() {
             if f.valid {
-                unsafe { let _ = windows::Win32::System::Ole::RevokeDragDrop(f.hwnd); };
+                unsafe {
+                    let _ = windows::Win32::System::Ole::RevokeDragDrop(f.hwnd);
+                };
             }
         }
     });
@@ -900,4 +911,3 @@ fn main() {
     }
     eprintln!("[feather] bye");
 }
-

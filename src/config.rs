@@ -178,7 +178,12 @@ fn normalize_dpi_with_system(c: &mut Config, system_dpi: u32) {
 /// 保持逻辑尺寸不变,把一个物理像素长度从保存 DPI 换算到当前窗口 DPI。
 pub fn scale_extent_for_dpi(value: i32, saved_dpi: u32, current_dpi: u32) -> i32 {
     // v1 没有保存 DPI;把未知值视为当前窗口 DPI可原样保留旧物理尺寸。
-    let from = if saved_dpi == 0 { current_dpi } else { saved_dpi }.max(1) as f64;
+    let from = if saved_dpi == 0 {
+        current_dpi
+    } else {
+        saved_dpi
+    }
+    .max(1) as f64;
     ((value as f64 * current_dpi.max(1) as f64) / from).round() as i32
 }
 
@@ -203,7 +208,10 @@ mod dpi_tests {
     fn v1_physical_geometry_stays_physical_and_dpi_remains_unknown() {
         let mut c = fixture(1, 2400, 260, 0);
         normalize_dpi_with_system(&mut c, 192);
-        assert_eq!((c.fences[0].x, c.fences[0].w, c.fences[0].dpi), (2400, 260, 0));
+        assert_eq!(
+            (c.fences[0].x, c.fences[0].w, c.fences[0].dpi),
+            (2400, 260, 0)
+        );
         assert_eq!(c.version, 3);
     }
 
@@ -211,7 +219,10 @@ mod dpi_tests {
     fn v2_logical_geometry_uses_the_legacy_system_dpi_migration() {
         let mut c = fixture(2, 1000, 260, 0);
         normalize_dpi_with_system(&mut c, 192);
-        assert_eq!((c.fences[0].x, c.fences[0].w, c.fences[0].dpi), (2000, 520, 192));
+        assert_eq!(
+            (c.fences[0].x, c.fences[0].w, c.fences[0].dpi),
+            (2000, 520, 192)
+        );
         assert_eq!(c.version, 3);
     }
 
@@ -219,7 +230,10 @@ mod dpi_tests {
     fn v3_physical_geometry_is_not_rescaled_by_system_dpi() {
         let mut c = fixture(3, 2000, 520, 192);
         normalize_dpi_with_system(&mut c, 96);
-        assert_eq!((c.fences[0].x, c.fences[0].w, c.fences[0].dpi), (2000, 520, 192));
+        assert_eq!(
+            (c.fences[0].x, c.fences[0].w, c.fences[0].dpi),
+            (2000, 520, 192)
+        );
     }
 
     #[test]

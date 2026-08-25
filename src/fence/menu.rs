@@ -1,22 +1,22 @@
 // 右键菜单:删除/重命名/透明度/图标大小/标题字号 + 重命名输入对话框。
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-    CLEARTYPE_QUALITY, HBRUSH, HGDIOBJ,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DeleteObject, HBRUSH,
+    HGDIOBJ, OUT_DEFAULT_PRECIS,
 };
-use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, GetWindowRect, GetWindowTextW, IsDialogMessageW,
-    IsWindow, LoadCursorW, RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow,
-    TrackPopupMenu, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_DBLCLKS,
-    ES_AUTOHSCROLL, HMENU, IDC_ARROW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SW_SHOW,
-    SW_SHOWNORMAL, TPM_NONOTIFY, TPM_RETURNCMD, TranslateMessage, WM_CLOSE, WM_COMMAND, WM_SETFONT,
-    WINDOW_STYLE, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME,
-    WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    AppendMenuW, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_DBLCLKS, CreatePopupMenu, CreateWindowExW,
+    DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, GetCursorPos,
+    GetMessageW, GetWindowRect, GetWindowTextW, HMENU, IDC_ARROW, IsDialogMessageW, IsWindow,
+    LoadCursorW, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, RegisterClassW, SW_SHOW,
+    SW_SHOWNORMAL, SendMessageW, SetForegroundWindow, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+    TrackPopupMenu, TranslateMessage, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_SETFONT, WNDCLASSW,
+    WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE,
 };
+use windows::core::{PCWSTR, w};
 
 use crate::utils::wstr;
 use crate::with_global;
@@ -87,7 +87,11 @@ pub fn fence_menu(hwnd: HWND) {
         let cur_icon = with_global(|g| g.config.icon.max(1));
         let icon_menu = CreatePopupMenu().unwrap_or_default();
         for (id, size) in [(1006u32, 24u32), (1007, 32), (1008, 48), (1009, 64)] {
-            let flags = if cur_icon == size { MF_STRING | MF_CHECKED } else { MF_STRING };
+            let flags = if cur_icon == size {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            };
             let _ = AppendMenuW(
                 icon_menu,
                 flags,
@@ -95,7 +99,12 @@ pub fn fence_menu(hwnd: HWND) {
                 PCWSTR(wstr(&format!("{} px", size)).as_ptr()),
             );
         }
-        let _ = AppendMenuW(menu, MF_POPUP, icon_menu.0 as usize, PCWSTR(w!("图标大小").as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            icon_menu.0 as usize,
+            PCWSTR(w!("图标大小").as_ptr()),
+        );
         // 标题字号子菜单(全局统一)
         let cur_title_font = with_global(|g| g.config.title_font_size.max(1));
         let title_font_menu = CreatePopupMenu().unwrap_or_default();
@@ -266,8 +275,9 @@ unsafe extern "system" fn input_wndproc(
                     let edit = HWND(*PROMPT_EDIT.lock().unwrap() as *mut std::ffi::c_void);
                     let mut buf = [0u16; 512];
                     let n = GetWindowTextW(edit, &mut buf);
-                    *PROMPT_RESULT.lock().unwrap() =
-                        Some(String::from_utf16_lossy(&buf[..(n.max(0) as usize).min(buf.len())]));
+                    *PROMPT_RESULT.lock().unwrap() = Some(String::from_utf16_lossy(
+                        &buf[..(n.max(0) as usize).min(buf.len())],
+                    ));
                     let _ = DestroyWindow(hwnd);
                 } else if id == 2 {
                     let _ = DestroyWindow(hwnd);
@@ -318,8 +328,15 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
         // 由客户区尺寸反推整窗尺寸(含标题栏/边框),否则底部按钮会被裁掉
         let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
         let exstyle = WS_EX_DLGMODALFRAME | WS_EX_TOOLWINDOW;
-        let mut wr = RECT { left: 0, top: 0, right: cw, bottom: ch };
-        let _ = windows::Win32::UI::HiDpi::AdjustWindowRectExForDpi(&mut wr, style, false, exstyle, dpi);
+        let mut wr = RECT {
+            left: 0,
+            top: 0,
+            right: cw,
+            bottom: ch,
+        };
+        let _ = windows::Win32::UI::HiDpi::AdjustWindowRectExForDpi(
+            &mut wr, style, false, exstyle, dpi,
+        );
         let dw = wr.right - wr.left;
         let dh = wr.bottom - wr.top;
 
@@ -365,7 +382,12 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
         );
         let set_font = |h: HWND| {
             if !font.is_invalid() {
-                let _ = SendMessageW(h, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+                let _ = SendMessageW(
+                    h,
+                    WM_SETFONT,
+                    Some(WPARAM(font.0 as usize)),
+                    Some(LPARAM(1)),
+                );
             }
         };
 
@@ -428,7 +450,12 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
         let _ = SetActiveWindow(dlg);
         let _ = SetFocus(Some(edit));
         // 全选编辑框内容,方便直接改名
-        let _ = SendMessageW(edit, 0x00B1 /* EM_SETSEL */, Some(WPARAM(0)), Some(LPARAM(-1)));
+        let _ = SendMessageW(
+            edit,
+            0x00B1, /* EM_SETSEL */
+            Some(WPARAM(0)),
+            Some(LPARAM(-1)),
+        );
         // 模态消息循环:直到对话框被销毁
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
