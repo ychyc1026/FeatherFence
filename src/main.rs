@@ -489,31 +489,23 @@ fn dispatch_menu(cmd: u32) {
             });
         }
         MENU_RELOAD => {
-            with_global(|g| {
-                let mut c = config::load();
-                config::normalize_dpi(&mut c);
-                c.title_font_size = config::normalize_title_font_size(c.title_font_size);
-                fence::set_icon_px(c.icon);
-                fence::set_title_font_px(c.title_font_size);
+            let mut c = config::load();
+            config::normalize_dpi(&mut c);
+            c.title_font_size = config::normalize_title_font_size(c.title_font_size);
+            fence::set_icon_px(c.icon);
+            fence::set_title_font_px(c.title_font_size);
+            let old_fences = with_global(|g| {
                 g.config = c;
                 // 保留进程级监听（桌面清扫和 Downloads 接管）；先停止所有栅栏监听，
                 // 避免窗口销毁期间仍收到刷新。
                 g.watchers
                     .retain(|watcher| watcher.owner == WatcherOwner::Process);
-                // 先销毁全部旧窗口(避免持借用调用 DestroyWindow)
-                let hwnds: Vec<HWND> = g
-                    .fences
-                    .iter()
-                    .filter(|f| f.valid)
-                    .map(|f| f.hwnd)
-                    .collect();
-                for h in hwnds {
-                    unsafe {
-                        let _ = windows::Win32::System::Ole::RevokeDragDrop(h);
-                        let _ = DestroyWindow(h);
-                    }
-                }
-                g.fences.clear(); // Fence 析构 → 各自目录监听自动停止
+                std::mem::take(&mut g.fences)
+            });
+            for fence in old_fences {
+                destroy_detached_fence(fence);
+            }
+            with_global(|g| {
                 g.droptargets.clear();
                 // 与启动恢复一致:重复/缺失 id 重新分配,保证按 id 刷新全部生效
                 let mut seen = std::collections::HashSet::new();

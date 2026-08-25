@@ -148,15 +148,19 @@ pub fn fence_menu(hwnd: HWND) {
         let _ = DestroyMenu(menu);
         let cmd = cmd.0 as u32;
         if cmd == 1001 {
-            with_global(|g| {
+            let detached = with_global(|g| {
                 if let Some(idx) = g.fences.iter().position(|f| f.hwnd == hwnd) {
                     if g.config.download_box_id == Some(g.fences[idx].cfg.id) {
                         crate::set_download_enabled(g, false);
-                        return;
+                        return None;
                     }
-                    crate::delete_fence(g, idx);
+                    return crate::detach_fence(g, idx);
                 }
+                None
             });
+            if let Some(fence) = detached {
+                crate::destroy_detached_fence(fence);
+            }
         } else if matches!(cmd, 1002..=1004 | 1012) {
             with_global(|g| {
                 if let Some(idx) = fence_idx(g, hwnd) {
