@@ -2,8 +2,8 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 撤销窗口：图标/栅栏被搬移后 1 分钟内可「撤销并关闭避让」,超时记录作废,
@@ -23,16 +23,15 @@ use windows::Win32::Foundation::{CloseHandle, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Memory::{
-    VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ};
 use windows::Win32::UI::Controls::{
-    LVM_GETITEMCOUNT, LVM_GETITEMPOSITION, LVM_GETITEMSPACING, LVM_SETITEMPOSITION,
-    LVS_AUTOARRANGE,
+    LVM_GETITEMCOUNT, LVM_GETITEMPOSITION, LVM_GETITEMSPACING, LVM_SETITEMPOSITION, LVS_AUTOARRANGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowLongPtrW, GetWindowThreadProcessId, SendMessageW, SetWindowLongPtrW,
-    GWL_STYLE,
+    GWL_STYLE, GetClientRect, GetWindowLongPtrW, GetWindowThreadProcessId, SendMessageW,
+    SetWindowLongPtrW,
 };
 
 fn overlaps(a: RECT, b: RECT) -> bool {
@@ -231,7 +230,10 @@ pub fn rollback_icons() -> usize {
     unsafe {
         let now = now_unix();
         let mut restored = 0;
-        let history = ICON_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let history = ICON_HISTORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(map) = history {
             for (idx, (p, t)) in &map {
                 if now.saturating_sub(*t) >= ROLLBACK_TTL_SECS {
@@ -254,7 +256,10 @@ pub fn rollback_icons() -> usize {
 /// 取出存活期内的栅栏移动前快照(供恢复几何),并清空历史。
 pub fn take_fence_history() -> Vec<(u32, crate::config::FenceCfg)> {
     let now = now_unix();
-    let map = FENCE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let map = FENCE_HISTORY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     match map {
         Some(m) => m
             .into_iter()
@@ -267,8 +272,14 @@ pub fn take_fence_history() -> Vec<(u32, crate::config::FenceCfg)> {
 
 /// 清空所有搬移/移动历史(关闭避让但不撤销时调用,图标保持当前位置)。
 pub fn clear_history() {
-    let _ = ICON_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let _ = FENCE_HISTORY.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let _ = ICON_HISTORY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    let _ = FENCE_HISTORY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
 }
 
 /// 关闭避让时调用：仅恢复桌面 ListView 在避让开启前的自动排列状态

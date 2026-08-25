@@ -1,16 +1,15 @@
-
 // 栅栏生命周期:创建/删除/可见性 + 桌面图标避让编排 + Explorer 重启看门狗 + 拖放处理。
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::System::Ole::RegisterDragDrop;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GetWindow, GetWindowRect, GW_HWNDPREV, HWND_TOP, IsIconic, IsWindow,
-    IsWindowVisible, PostMessageW, SetWindowPos, ShowWindow, SW_HIDE, SW_SHOWNA, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    DestroyWindow, GW_HWNDPREV, GetWindow, GetWindowRect, HWND_TOP, IsIconic, IsWindow,
+    IsWindowVisible, PostMessageW, SW_HIDE, SW_SHOWNA, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, ShowWindow,
 };
+use windows::core::{PCWSTR, w};
 
 use crate::config::{self, FenceCfg};
 use crate::desktop_icons;
@@ -21,7 +20,7 @@ use crate::perf;
 use crate::tray;
 use crate::utils::{self, wstr};
 use crate::watcher;
-use crate::{with_global, Global};
+use crate::{Global, with_global};
 
 use super::{ManagedWatcher, WatcherOwner};
 
@@ -39,8 +38,11 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     if cfg.pos_set != Some(true) && cfg.x == 0 && cfg.y == 0 {
         let (sw, sh) = utils::screen_size();
         let n = g.fences.len();
-        cfg.x = (sw - (320.0 * ms) as i32 - (20.0 * ms) as i32 - (n as i32 % 5) * (30.0 * ms) as i32).max(0);
-        cfg.y = ((80.0 * ms) as i32 + (n as i32 % 5) * (40.0 * ms) as i32).min((sh - (400.0 * ms) as i32).max(0));
+        cfg.x =
+            (sw - (320.0 * ms) as i32 - (20.0 * ms) as i32 - (n as i32 % 5) * (30.0 * ms) as i32)
+                .max(0);
+        cfg.y = ((80.0 * ms) as i32 + (n as i32 % 5) * (40.0 * ms) as i32)
+            .min((sh - (400.0 * ms) as i32).max(0));
     }
     // 恢复配置时先按保存 DPI 钳制;窗口创建后再按实际窗口 DPI 做最终换算。
     // 若这里使用系统 DPI,主屏 200% + 副屏 100% 会在创建副屏窗口前把尺寸错误放大。
@@ -63,7 +65,9 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     // 注册拖放
     let dt = droptarget::FenceDropTarget::new(hwnd);
     let it: windows::Win32::System::Ole::IDropTarget = dt.into();
-    unsafe { let _ = RegisterDragDrop(hwnd, &it); }
+    unsafe {
+        let _ = RegisterDragDrop(hwnd, &it);
+    }
     // 保持 COM 对象存活:塞进全局集合,进程退出时释放
     g.droptargets.push(it);
 
@@ -78,10 +82,10 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     // 尺寸变化可能让跨屏窗口的主显示器切换;重新读取实际 DPI,最多再换算一次。
     for _ in 0..2 {
         f.dpi = current_dpi as f32 / 96.0;
-        let restored_w = config::scale_extent_for_dpi(saved_w, saved_dpi, current_dpi)
-            .max(fence::min_w(f.dpi));
-        let restored_h = config::scale_extent_for_dpi(saved_h, saved_dpi, current_dpi)
-            .max(fence::min_h(f.dpi));
+        let restored_w =
+            config::scale_extent_for_dpi(saved_w, saved_dpi, current_dpi).max(fence::min_w(f.dpi));
+        let restored_h =
+            config::scale_extent_for_dpi(saved_h, saved_dpi, current_dpi).max(fence::min_h(f.dpi));
         if restored_w != f.cfg.w || restored_h != f.cfg.h {
             unsafe {
                 let _ = SetWindowPos(
@@ -133,7 +137,9 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     // Win32 的实际 DPI 和窗口矩形为准,避免 cfg.dpi、f.dpi、w/h 互相矛盾。
     f.dpi = fence::window_dpi(hwnd);
     let mut final_rect = RECT::default();
-    unsafe { let _ = GetWindowRect(hwnd, &mut final_rect); }
+    unsafe {
+        let _ = GetWindowRect(hwnd, &mut final_rect);
+    }
     f.cfg.x = final_rect.left;
     f.cfg.y = final_rect.top;
     f.cfg.w = (final_rect.right - final_rect.left).max(1);
@@ -146,7 +152,11 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     // 目录监听(所有栅栏):文件夹栅栏监听门户目录,收纳栅栏监听收纳箱目录。
     // 通知按栅栏 id 发给消息窗口——不持有具体 hwnd,窗口被 Explorer 销毁重建后
     // watcher 无需重绑仍能按 id 找到新窗口;删除栅栏/重载时随 ManagedWatcher 停止。
-    let watch_dir = f.cfg.folder.clone().unwrap_or_else(|| config::vault_dir(&g.config));
+    let watch_dir = f
+        .cfg
+        .folder
+        .clone()
+        .unwrap_or_else(|| config::vault_dir(&g.config));
     let fid = id;
     let mhwnd = g.msg_hwnd.0 as usize;
     g.fences.push(f);
@@ -154,15 +164,13 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     let new_idx = g.fences.len() - 1;
     fence::settle_fence(g, new_idx);
 
-    let watcher = watcher::spawn_dir_watcher(watch_dir, move |_names| {
-        unsafe {
-            let _ = PostMessageW(
-                Some(HWND(mhwnd as *mut c_void)),
-                fence::WM_APP_REFRESH_ID,
-                WPARAM(fid as usize),
-                LPARAM(0),
-            );
-        }
+    let watcher = watcher::spawn_dir_watcher(watch_dir, move |_names| unsafe {
+        let _ = PostMessageW(
+            Some(HWND(mhwnd as *mut c_void)),
+            fence::WM_APP_REFRESH_ID,
+            WPARAM(fid as usize),
+            LPARAM(0),
+        );
     });
     g.watchers.push(ManagedWatcher::fence(fid, watcher));
     sync_config(g);
@@ -251,11 +259,12 @@ pub(crate) fn watchdog_tick(g: &mut Global) {
     for f in g.fences.iter_mut() {
         let intentionally_hidden = download_id == Some(f.cfg.id) && !download_shown;
         if f.valid && !g.zen && !intentionally_hidden {
-            let hidden_or_minimized = unsafe {
-                IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool()
-            };
+            let hidden_or_minimized =
+                unsafe { IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool() };
             if hidden_or_minimized {
-                unsafe { let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE); }
+                unsafe {
+                    let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
+                }
                 fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
             }
         }
@@ -268,14 +277,18 @@ pub(crate) fn watchdog_tick(g: &mut Global) {
             if !hwnd.is_invalid() {
                 let dt = droptarget::FenceDropTarget::new(hwnd);
                 let it: windows::Win32::System::Ole::IDropTarget = dt.into();
-                unsafe { let _ = RegisterDragDrop(hwnd, &it); }
+                unsafe {
+                    let _ = RegisterDragDrop(hwnd, &it);
+                }
                 g.droptargets.push(it);
                 f.hwnd = hwnd;
                 f.valid = true;
                 f.moving = false;
                 f.resizing = None;
                 if g.zen {
-                    unsafe { let _ = ShowWindow(hwnd, SW_HIDE); };
+                    unsafe {
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                    };
                 }
                 // watcher 仍挂在 f 上且按栅栏 id 通知,新窗口自动恢复实时刷新
                 fence::refresh_entries(f, &config::vault_dir(&g.config));
@@ -311,7 +324,9 @@ pub(crate) fn desktop_layer_tick(g: &mut Global) {
     if g.zen {
         return;
     }
-    let host_valid = g.desktop_host.is_some_and(|h| unsafe { IsWindow(Some(h)).as_bool() });
+    let host_valid = g
+        .desktop_host
+        .is_some_and(|h| unsafe { IsWindow(Some(h)).as_bool() });
     if !host_valid {
         g.desktop_host = utils::find_desktop_host();
     }
@@ -369,7 +384,10 @@ fn format_drop_failures(
         message.push_str(&format!("• {name}：{error}\n"));
     }
     if failures.len() > MAX_DETAILS {
-        message.push_str(&format!("• 另有 {} 个项目未列出\n", failures.len() - MAX_DETAILS));
+        message.push_str(&format!(
+            "• 另有 {} 个项目未列出\n",
+            failures.len() - MAX_DETAILS
+        ));
     }
     message.push_str("\n请检查原位置和目标目录后重试。程序不会主动删除未成功移动的源项目。");
     message
@@ -403,9 +421,7 @@ pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>, copy_requested: bool) 
                 continue;
             }
             // MOVE 到自身目录没有意义；COPY 到自身目录则应生成一个重名副本。
-            if !copy_requested
-                && src.parent().map(|d| d == target.as_path()).unwrap_or(false)
-            {
+            if !copy_requested && src.parent().map(|d| d == target.as_path()).unwrap_or(false) {
                 continue;
             }
             let operation = if copy_requested {
@@ -423,7 +439,9 @@ pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>, copy_requested: bool) 
             }
         }
         if succeeded > 0 {
-            unsafe { let _ = PostMessageW(Some(hwnd), WM_APP_DROP, WPARAM(0), LPARAM(0)); };
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_APP_DROP, WPARAM(0), LPARAM(0));
+            };
         }
         if !failures.is_empty() {
             // 拖放失败静默是历史缺陷:至少给用户一个托盘气泡提示

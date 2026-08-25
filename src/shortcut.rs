@@ -1,4 +1,3 @@
-
 // 快捷方式自动收纳:桌面新增 .lnk 按"快捷方式占比/数量"选目标收纳栅栏。
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -8,7 +7,7 @@ use crate::config::{self, FenceKind};
 use crate::fence;
 use crate::fencelife::reserve_desktop_icons;
 use crate::watcher;
-use crate::{with_global, Global};
+use crate::{Global, with_global};
 
 use super::{CollectionStats, FileCandidate};
 
@@ -150,7 +149,9 @@ impl ShortcutDragoutState {
     }
 
     fn is_dragged_name(&self, path: &Path) -> bool {
-        let Some(stem) = path.file_stem().map(|value| value.to_string_lossy().to_lowercase())
+        let Some(stem) = path
+            .file_stem()
+            .map(|value| value.to_string_lossy().to_lowercase())
         else {
             return false;
         };
@@ -160,7 +161,9 @@ impl ShortcutDragoutState {
         let prefix = format!("{} (", self.source_stem);
         stem.strip_prefix(&prefix)
             .and_then(|suffix| suffix.strip_suffix(')'))
-            .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+            .is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+            })
     }
 
     fn should_suppress(&self, path: &Path, now: Instant) -> bool {
@@ -210,11 +213,7 @@ pub(crate) fn finish_shortcut_dragout() {
                 g.shortcut_pending.remove(&path);
                 g.shortcut_seen.insert(path);
             } else {
-                queue_new_shortcut_candidate(
-                    &mut g.shortcut_seen,
-                    &mut g.shortcut_pending,
-                    path,
-                );
+                queue_new_shortcut_candidate(&mut g.shortcut_seen, &mut g.shortcut_pending, path);
             }
         }
         state.ignore_until = Some(now + DRAGOUT_EVENT_TAIL);
@@ -240,8 +239,7 @@ fn ingest_shortcut_events(g: &mut Global) {
             queue_new_shortcut_candidate(&mut g.shortcut_seen, &mut g.shortcut_pending, path);
         }
     }
-    if g
-        .shortcut_dragout
+    if g.shortcut_dragout
         .as_ref()
         .is_some_and(|state| !state.active && state.ignore_until.is_some_and(|until| now > until))
     {
@@ -418,10 +416,7 @@ mod shortcut_collection_tests {
         let mut state = dragout_state();
         state.ignore_until = Some(Instant::now() + Duration::from_secs(1));
 
-        assert!(state.should_suppress(
-            Path::new(r"C:\Users\TEST\Desktop\app.lnk"),
-            Instant::now()
-        ));
+        assert!(state.should_suppress(Path::new(r"C:\Users\TEST\Desktop\app.lnk"), Instant::now()));
         assert!(state.should_suppress(
             Path::new(r"C:\Users\test\Desktop\App (2).lnk"),
             Instant::now()
@@ -441,10 +436,9 @@ mod shortcut_collection_tests {
         let mut state = dragout_state();
         state.ignore_until = Some(Instant::now() - Duration::from_secs(1));
 
-        assert!(!state.should_suppress(
-            Path::new(r"C:\Users\test\Desktop\App.lnk"),
-            Instant::now()
-        ));
+        assert!(
+            !state.should_suppress(Path::new(r"C:\Users\test\Desktop\App.lnk"), Instant::now())
+        );
     }
 
     #[test]

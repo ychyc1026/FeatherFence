@@ -1,7 +1,9 @@
 // 网格布局:翻页/动画 + 磁吸吸附/防重叠/防溢出 + 命中测试。
 use std::time::{Duration, Instant};
 
-use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+use windows::Win32::UI::WindowsAndMessaging::{
+    KillTimer, SWP_NOACTIVATE, SWP_NOZORDER, SetTimer, SetWindowPos,
+};
 
 use crate::config::FenceCfg;
 use crate::utils::work_area;
@@ -147,8 +149,12 @@ fn snap_size(f: &Fence, w: i32, h: i32) -> (i32, i32) {
     let d = f.dpi;
     let cw = cell_w(f);
     let ch = cell_h(f);
-    let cols = (((w - 2 * margin(d) - rail(d)) as f32 / cw as f32).round().max(1.0)) as i32;
-    let rows = (((h - title_h(d) - 2 * margin(d)) as f32 / ch as f32).round().max(1.0)) as i32;
+    let cols = (((w - 2 * margin(d) - rail(d)) as f32 / cw as f32)
+        .round()
+        .max(1.0)) as i32;
+    let rows = (((h - title_h(d) - 2 * margin(d)) as f32 / ch as f32)
+        .round()
+        .max(1.0)) as i32;
     (
         (2 * margin(d) + rail(d) + cols * cw).max(min_w(d)),
         (title_h(d) + 2 * margin(d) + rows * ch).max(min_h(d)),
@@ -161,10 +167,9 @@ fn rects_overlap(ax: i32, ay: i32, aw: i32, ah: i32, bx: i32, by: i32, bw: i32, 
 
 /// 是否与除 self_idx 外的其他栅栏重叠
 fn overlaps_any(g: &crate::Global, self_idx: usize, x: i32, y: i32, w: i32, h: i32) -> bool {
-    g.fences
-        .iter()
-        .enumerate()
-        .any(|(i, o)| i != self_idx && o.valid && rects_overlap(x, y, w, h, o.cfg.x, o.cfg.y, o.cfg.w, o.cfg.h))
+    g.fences.iter().enumerate().any(|(i, o)| {
+        i != self_idx && o.valid && rects_overlap(x, y, w, h, o.cfg.x, o.cfg.y, o.cfg.w, o.cfg.h)
+    })
 }
 
 /// 松手整理:把 idx 栅栏吸附到网格尺寸/位置,clamp 进工作区,若有重叠沿螺旋挪到最近空闲槽位。
@@ -275,4 +280,3 @@ pub(crate) fn resize_dir_at(f: &Fence, x: i32, y: i32) -> Option<ResizeDir> {
         _ => None,
     }
 }
-

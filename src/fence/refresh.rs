@@ -15,7 +15,10 @@ pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) {
     let profiling = crate::perf::enabled();
     let total_started = profiling.then(Instant::now);
     let page = f.page;
-    let selected_path = f.selected.and_then(|i| f.entries.get(i)).map(|e| e.path.clone());
+    let selected_path = f
+        .selected
+        .and_then(|i| f.entries.get(i))
+        .map(|e| e.path.clone());
     f.entries.clear();
     let dir = f.cfg.folder.clone().unwrap_or_else(|| vault.clone());
     let read_started = profiling.then(Instant::now);
@@ -87,9 +90,9 @@ pub(crate) fn refresh_fence_now(g: &mut Global, idx: usize) {
 }
 #[cfg(test)]
 mod refresh_tests {
-    use super::{refresh_entries, REFRESH_DEBOUNCE_MS};
+    use super::{REFRESH_DEBOUNCE_MS, refresh_entries};
     use crate::config::FenceCfg;
-    use crate::fence::grid::{animation_progress, grid_dims, ANIM_DURATION};
+    use crate::fence::grid::{ANIM_DURATION, animation_progress, grid_dims};
     use crate::fence::{Fence, RefreshState, RefreshTimerAction};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use windows::Win32::Foundation::HWND;

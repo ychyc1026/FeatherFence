@@ -2,19 +2,19 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 
-use windows::core::{implement, Ref, Result, w};
 use windows::Win32::Foundation::{HWND, MAX_PATH, POINTL};
 use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL};
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows::Win32::System::Ole::ReleaseStgMedium;
 use windows::Win32::System::Ole::CF_HDROP;
+use windows::Win32::System::Ole::ReleaseStgMedium;
 use windows::Win32::System::Ole::{
     DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl,
 };
 use windows::Win32::System::SystemServices::{MK_CONTROL, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-use windows::Win32::UI::Shell::{DragQueryFileW, ILCombine, ILFree, SHGetPathFromIDListW, HDROP};
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP, ILCombine, ILFree, SHGetPathFromIDListW};
+use windows::core::{Ref, Result, implement, w};
 
 #[implement(IDropTarget)]
 pub struct FenceDropTarget {

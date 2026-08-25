@@ -5,26 +5,26 @@
 // drop target 接住(文件已在自身目录则跳过 → 无操作)。
 use std::cell::Cell;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use windows::core::{implement, Error, Ref, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{
-    GlobalFree, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, E_INVALIDARG,
-    E_NOTIMPL, E_UNEXPECTED, HGLOBAL, POINT, S_FALSE, S_OK,
+    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, E_INVALIDARG, E_NOTIMPL,
+    E_UNEXPECTED, GlobalFree, HGLOBAL, POINT, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{
-    IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumFORMATETC_Impl, IEnumSTATDATA,
-    DVASPECT_CONTENT, FORMATETC, STGMEDIUM, TYMED_HGLOBAL,
+    DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC,
+    IEnumFORMATETC_Impl, IEnumSTATDATA, STGMEDIUM, TYMED_HGLOBAL,
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GHND};
+use windows::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::{
-    DoDragDrop, IDropSource, IDropSource_Impl, CF_HDROP, DROPEFFECT, DROPEFFECT_COPY,
-    DROPEFFECT_MOVE, DROPEFFECT_NONE, ReleaseStgMedium,
+    CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, DoDragDrop,
+    IDropSource, IDropSource_Impl, ReleaseStgMedium,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::{CFSTR_PERFORMEDDROPEFFECT, DROPFILES};
+use windows::core::{BOOL, Error, HRESULT, Ref, Result, implement};
 
 /// DATA_E_FORMATETC:请求的格式不是 CF_HDROP
 const DATA_E_FORMATETC: HRESULT = HRESULT(0x80040064_u32 as _);
@@ -69,10 +69,7 @@ pub fn start_drag(paths: Vec<String>) -> DROPEFFECT {
         };
         crate::dlog(&format!(
             "[dragout] DoDragDrop hr=0x{:08x} effect={} performed={} final={}",
-            hr.0 as u32,
-            effect.0,
-            shell_reported,
-            name
+            hr.0 as u32, effect.0, shell_reported, name
         ));
         final_effect
     }
@@ -210,11 +207,7 @@ impl IEnumFORMATETC_Impl for FileFormatEnum_Impl {
                 *pceltfetched = n;
             }
             // 返回的少于请求的 → S_FALSE(枚举结束)
-            if n == celt {
-                S_OK
-            } else {
-                S_FALSE
-            }
+            if n == celt { S_OK } else { S_FALSE }
         }
     }
 

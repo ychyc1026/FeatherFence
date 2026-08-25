@@ -2,50 +2,47 @@
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::System::SystemServices::MK_LBUTTON;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TrackMouseEvent, VK_DELETE, TME_LEAVE,
-    TRACKMOUSEEVENT, TRACKMOUSEEVENT_FLAGS,
+    ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
+    TRACKMOUSEEVENT_FLAGS, TrackMouseEvent, VK_DELETE,
 };
-use windows::Win32::System::SystemServices::MK_LBUTTON;
 use windows::Win32::UI::Shell::{
-    ShellExecuteW, SHFileOperationW, SHFILEOPSTRUCTW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
-    FOF_NOERRORUI, FO_DELETE,
+    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, SHFILEOPSTRUCTW, SHFileOperationW,
+    ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetCursorPos, GetSystemMetrics, GetWindowRect, LoadCursorW,
-    PostMessageW, RegisterClassW, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow,
-    CS_DBLCLKS, HTCLIENT, IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
-    IDC_SIZEALL, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SC_MINIMIZE, SIZE_MINIMIZED, WNDCLASSW,
-    WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
-    WM_SYSCOMMAND, WM_TIMER, WM_DISPLAYCHANGE, WM_DPICHANGED, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_POPUP,
+    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, GetCursorPos, GetSystemMetrics, GetWindowRect,
+    HTCLIENT, IDC_ARROW, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
+    LoadCursorW, PostMessageW, RegisterClassW, SC_MINIMIZE, SIZE_MINIMIZED, SM_CXDRAG, SM_CYDRAG,
+    SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, WM_CANCELMODE,
+    WM_CAPTURECHANGED, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSCOMMAND, WM_TIMER, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
 };
+use windows::core::{PCWSTR, w};
 
-use crate::config::{scale_extent_for_dpi, FenceCfg};
+use crate::config::{FenceCfg, scale_extent_for_dpi};
 use crate::utils::{work_area, wstr};
-use crate::{with_global, Global};
+use crate::{Global, with_global};
 
-use super::geometry::{
-    cell_h, cell_w, margin, min_h, min_w, rail, title_h, window_dpi,
-};
+use super::geometry::{cell_h, cell_w, margin, min_h, min_w, rail, title_h, window_dpi};
 use super::grid::{
-    config_snapshot, grid_dims, hit_item, magnet_size_smooth, magnet_smooth, resize_dir_at,
-    settle_fence, start_page_anim, step_page_anim, sync_page, total_pages, ANIM_TICK,
+    ANIM_TICK, config_snapshot, grid_dims, hit_item, magnet_size_smooth, magnet_smooth,
+    resize_dir_at, settle_fence, start_page_anim, step_page_anim, sync_page, total_pages,
 };
 use super::menu::{fence_menu, rename_fence};
 use super::refresh::{
-    refresh_entries, refresh_fence_now, restart_refresh_timer, stop_refresh_timer,
-    REFRESH_DEBOUNCE_MS, REFRESH_TICK,
+    REFRESH_DEBOUNCE_MS, REFRESH_TICK, refresh_entries, refresh_fence_now, restart_refresh_timer,
+    stop_refresh_timer,
 };
 use super::render::{continue_perf_animation, render_fence};
 use super::{RefreshTimerAction, ResizeDir, WM_APP_DESKTOP_RESTORE, WM_APP_DROP, WM_APP_REFRESH};
@@ -137,7 +134,8 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
             let _ = GetWindowRect(hwnd, &mut rc);
             let cx = (rc.left + rc.right) / 2;
             let cy = (rc.top + rc.bottom) / 2;
-            let _hit = windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT { x: cx, y: cy });
+            let _hit =
+                windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT { x: cx, y: cy });
             crate::dlog(&format!(
                 "[feather] created hwnd=0x{:x} at ({},{},{},{})",
                 hwnd.0 as usize, rc.left, rc.top, rc.right, rc.bottom
@@ -235,7 +233,10 @@ fn recycle_path(hwnd: HWND, path: &std::path::Path) -> Result<(), String> {
     if code == 0 && !op.fAnyOperationsAborted.as_bool() {
         Ok(())
     } else {
-        Err(format!("SHFileOperationW code={code}, aborted={}", op.fAnyOperationsAborted.as_bool()))
+        Err(format!(
+            "SHFileOperationW code={code}, aborted={}",
+            op.fAnyOperationsAborted.as_bool()
+        ))
     }
 }
 unsafe extern "system" fn fence_wndproc(
@@ -333,7 +334,9 @@ unsafe extern "system" fn fence_wndproc(
             let path = with_global(|g| {
                 let idx = fence_idx(g, hwnd)?;
                 let f = &g.fences[idx];
-                f.selected.and_then(|i| f.entries.get(i)).map(|e| e.path.clone())
+                f.selected
+                    .and_then(|i| f.entries.get(i))
+                    .map(|e| e.path.clone())
             });
             if let Some(path) = path {
                 match recycle_path(hwnd, &path) {
@@ -399,8 +402,18 @@ unsafe extern "system" fn fence_wndproc(
                             // 连续磁吸:平滑拉向最近格点,越近拉得越紧(无瞬移跳变);
                             // 同时 clamp 进工作区,防拖出屏幕
                             let wa = work_area(hwnd);
-                            let rx = magnet_smooth((cur.x - f.move_off.0) as f32, cell_w(f), wa.left, 0.5);
-                            let ry = magnet_smooth((cur.y - f.move_off.1) as f32, cell_h(f), wa.top, 0.5);
+                            let rx = magnet_smooth(
+                                (cur.x - f.move_off.0) as f32,
+                                cell_w(f),
+                                wa.left,
+                                0.5,
+                            );
+                            let ry = magnet_smooth(
+                                (cur.y - f.move_off.1) as f32,
+                                cell_h(f),
+                                wa.top,
+                                0.5,
+                            );
                             let mut nx = rx.round() as i32;
                             let mut ny = ry.round() as i32;
                             nx = nx.clamp(wa.left, (wa.right - f.cfg.w).max(wa.left));
@@ -425,10 +438,17 @@ unsafe extern "system" fn fence_wndproc(
                             let _ = GetCursorPos(&mut cur);
                             let mut rc = RECT::default();
                             let _ = GetWindowRect(hwnd, &mut rc);
-                            let (mut nx, mut ny, mut nw, mut nh) = (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
-                            let apply = |nx: &mut i32, ny: &mut i32, nw: &mut i32, nh: &mut i32, dir: ResizeDir| {
+                            let (mut nx, mut ny, mut nw, mut nh) =
+                                (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top);
+                            let apply = |nx: &mut i32,
+                                         ny: &mut i32,
+                                         nw: &mut i32,
+                                         nh: &mut i32,
+                                         dir: ResizeDir| {
                                 match dir {
-                                    ResizeDir::E | ResizeDir::NE | ResizeDir::SE => *nw = (cur.x - *nx).max(min_w(d)),
+                                    ResizeDir::E | ResizeDir::NE | ResizeDir::SE => {
+                                        *nw = (cur.x - *nx).max(min_w(d))
+                                    }
                                     ResizeDir::W | ResizeDir::NW | ResizeDir::SW => {
                                         let right = *nx + *nw;
                                         *nx = cur.x.min(right - min_w(d));
@@ -437,7 +457,9 @@ unsafe extern "system" fn fence_wndproc(
                                     _ => {}
                                 }
                                 match dir {
-                                    ResizeDir::S | ResizeDir::SE | ResizeDir::SW => *nh = (cur.y - *ny).max(min_h(d)),
+                                    ResizeDir::S | ResizeDir::SE | ResizeDir::SW => {
+                                        *nh = (cur.y - *ny).max(min_h(d))
+                                    }
                                     ResizeDir::N | ResizeDir::NE | ResizeDir::NW => {
                                         let bottom = *ny + *nh;
                                         *ny = cur.y.min(bottom - min_h(d));
@@ -449,11 +471,31 @@ unsafe extern "system" fn fence_wndproc(
                             apply(&mut nx, &mut ny, &mut nw, &mut nh, dir);
                             // 连续尺寸磁吸(平滑拉向整数格子,无跳变)+ clamp 工作区(防溢出)
                             let wa = work_area(hwnd);
-                            let nw2 = magnet_size_smooth(nw as f32, cell_w(f), 2 * margin(d) + rail(d), 0.5).round() as i32;
-                            let nh2 = magnet_size_smooth(nh as f32, cell_h(f), title_h(d) + 2 * margin(d), 0.5).round() as i32;
+                            let nw2 = magnet_size_smooth(
+                                nw as f32,
+                                cell_w(f),
+                                2 * margin(d) + rail(d),
+                                0.5,
+                            )
+                            .round() as i32;
+                            let nh2 = magnet_size_smooth(
+                                nh as f32,
+                                cell_h(f),
+                                title_h(d) + 2 * margin(d),
+                                0.5,
+                            )
+                            .round() as i32;
                             let nw = nw2.min((wa.right - nx).max(min_w(d)));
                             let nh = nh2.min((wa.bottom - ny).max(min_h(d)));
-                            let _ = SetWindowPos(hwnd, None, nx, ny, nw, nh, SWP_NOZORDER | SWP_NOACTIVATE);
+                            let _ = SetWindowPos(
+                                hwnd,
+                                None,
+                                nx,
+                                ny,
+                                nw,
+                                nh,
+                                SWP_NOZORDER | SWP_NOACTIVATE,
+                            );
                             // 实时跟随:同步 cfg 尺寸并重绘,内容平滑缩放(而非松手后瞬间刷新)。
                             // 每帧重新提交 ULW 表面,尺寸与窗口矩形保持一致。
                             f.cfg.x = nx;
@@ -476,7 +518,9 @@ unsafe extern "system" fn fence_wndproc(
                                 f.hover = None;
                                 if let Some(didx) = didx {
                                     if let Some(p) = f.entries.get(didx).map(|e| e.path.clone()) {
-                                        unsafe { let _ = ReleaseCapture(); };
+                                        unsafe {
+                                            let _ = ReleaseCapture();
+                                        };
                                         let vault = crate::config::vault_dir(&g.config);
                                         drag_path = Some((p.to_string_lossy().to_string(), vault));
                                     }
@@ -643,7 +687,8 @@ unsafe extern "system" fn fence_wndproc(
                     f.wheel_acc -= steps * 120;
                     let pages = total_pages(f);
                     let dir = if steps < 0 { 1 } else { -1 };
-                    let np = (f.page as i32 + dir * steps.abs()).clamp(0, pages as i32 - 1) as usize;
+                    let np =
+                        (f.page as i32 + dir * steps.abs()).clamp(0, pages as i32 - 1) as usize;
                     if np != f.page {
                         f.page = np;
                         start_page_anim(f);
@@ -811,7 +856,7 @@ unsafe extern "system" fn fence_wndproc(
 
 #[cfg(test)]
 mod pointer_interaction_tests {
-    use super::{reset_pointer_interaction, ResizeDir};
+    use super::{ResizeDir, reset_pointer_interaction};
     use crate::config::FenceCfg;
     use crate::fence::Fence;
     use windows::Win32::Foundation::HWND;

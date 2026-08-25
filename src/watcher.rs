@@ -6,16 +6,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
-    FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED,
+    FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
 };
 use windows::Win32::System::IO::CancelSynchronousIo;
+use windows::core::PCWSTR;
 
 use crate::utils::wstr;
 
@@ -144,7 +143,9 @@ where
             }
             if ok.is_err() || returned == 0 {
                 // 目录失效,关掉重来
-                unsafe { let _ = windows::Win32::Foundation::CloseHandle(h); }
+                unsafe {
+                    let _ = windows::Win32::Foundation::CloseHandle(h);
+                }
                 handle = None;
                 if thread_stop.wait_timeout(Duration::from_secs(3)) {
                     break;
@@ -182,7 +183,10 @@ fn parse_notify_names(buf: &[u8], returned: usize) -> Vec<String> {
         let next = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
         let action = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap());
         let name_len = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()) as usize;
-        let Some(name_end) = off.checked_add(HEADER_LEN).and_then(|n| n.checked_add(name_len)) else {
+        let Some(name_end) = off
+            .checked_add(HEADER_LEN)
+            .and_then(|n| n.checked_add(name_len))
+        else {
             break;
         };
         if name_len % 2 != 0 || name_end > end {
@@ -203,7 +207,9 @@ fn parse_notify_names(buf: &[u8], returned: usize) -> Vec<String> {
         if next == 0 {
             break;
         }
-        let Some(new_off) = off.checked_add(next) else { break };
+        let Some(new_off) = off.checked_add(next) else {
+            break;
+        };
         if new_off <= off || new_off > end {
             break;
         }
@@ -501,7 +507,13 @@ pub fn unique_dest(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
             return c;
         }
     }
-    dir.join(format!("{stem} ({}){ext}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)))
+    dir.join(format!(
+        "{stem} ({}){ext}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    ))
 }
 
 #[cfg(test)]
