@@ -578,7 +578,7 @@ unsafe extern "system" fn fence_wndproc(
                     f.drag_moved = false;
                     if y < title_h(f.dpi) {
                         if avoid {
-                            crate::desktop_icons::record_fence(&f.cfg);
+                            crate::desktop::avoidance::record_fence(&f.cfg);
                         }
                         f.moving = true;
                         let mut cur = POINT::default();
@@ -589,7 +589,7 @@ unsafe extern "system" fn fence_wndproc(
                         SetCapture(hwnd);
                     } else if let Some(dir) = resize_dir_at(f, x, y) {
                         if avoid {
-                            crate::desktop_icons::record_fence(&f.cfg);
+                            crate::desktop::avoidance::record_fence(&f.cfg);
                         }
                         f.resizing = Some(dir);
                         SetCapture(hwnd);
