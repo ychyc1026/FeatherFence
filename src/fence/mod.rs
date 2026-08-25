@@ -8,6 +8,7 @@
 
 mod geometry;
 mod grid;
+mod interaction;
 mod menu;
 mod model;
 mod refresh;
@@ -28,6 +29,7 @@ use render::RenderCache;
 // 对外 API 重导出:保持 crate::fence::X 全部调用点不变
 pub use geometry::{dpi_scale, min_h, min_w, set_icon_px, set_title_font_px, window_dpi};
 pub use grid::{config_snapshot, settle_fence};
+pub use interaction::{FenceInteraction, ResizeDir};
 pub use model::{Entry, FenceModel};
 pub use refresh::refresh_entries;
 pub use render::{render_fence, start_perf_animation};
@@ -131,18 +133,6 @@ impl RefreshSignal {
 
 unsafe impl Send for Fence {}
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum ResizeDir {
-    N,
-    S,
-    E,
-    W,
-    NW,
-    NE,
-    SW,
-    SE,
-}
-
 pub struct Fence {
     pub cfg: FenceCfg,
     pub hwnd: HWND,
@@ -158,19 +148,8 @@ pub struct Fence {
     pub anim_started: Instant,
     pub anim_from: f32,
     perf_anim_remaining: u32,
-    /// 滚轮增量累加器(1/120 刻度):触控板/高精度滚轮的小增量先累积,满 120 再翻页
-    pub wheel_acc: i32,
-    pub hover: Option<usize>,
-    pub moving: bool,
-    pub move_off: (i32, i32),
-    pub resizing: Option<ResizeDir>,
-    /// 按下后是否真的拖动/缩放移动过(区分单击标题与拖动:单击不触发 settle)
-    pub drag_moved: bool,
-    pub hover_visible: bool,
-    /// 拖出:按下的条目索引(移动超阈值后启动 OLE 拖拽)
-    pub drag_idx: Option<usize>,
-    /// 拖出:按下时的客户区坐标(拖拽阈值判断用)
-    pub drag_down: (i32, i32),
+    /// 鼠标、滚轮、移动、缩放和条目拖出状态。
+    pub interaction: FenceInteraction,
     /// 目录监听线程与窗口消息之间的刷新合并信号。
     pub refresh_signal: RefreshSignal,
     /// 已渲染 DIB 缓存:ULW 整幅提交的源(内容不保留,必须自己存)
@@ -190,15 +169,7 @@ impl Fence {
             anim_started: Instant::now(),
             anim_from: 0.0,
             perf_anim_remaining: 0,
-            wheel_acc: 0,
-            hover: None,
-            moving: false,
-            move_off: (0, 0),
-            resizing: None,
-            drag_moved: false,
-            hover_visible: false,
-            drag_idx: None,
-            drag_down: (0, 0),
+            interaction: FenceInteraction::default(),
             refresh_signal: RefreshSignal::default(),
             cache: None,
             valid: true,
