@@ -7,6 +7,7 @@
 
 // 轻栅栏 feather-fences:超轻量桌面分区整理工具
 // Rust + Win32 原生实现,Fences 轻量版(GPL-3.0,受 Fluid Fences 概念启发,代码为原创)
+mod app;
 mod config;
 mod desktop;
 mod download;
@@ -46,11 +47,12 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
-    PostQuitMessage, RegisterClassW, TranslateMessage, WM_APP, WM_DESTROY, WM_HOTKEY, WM_QUIT,
-    WM_TIMER, WNDCLASSW, WS_POPUP,
+    PostQuitMessage, RegisterClassW, TranslateMessage, WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_TIMER,
+    WNDCLASSW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
+use app::command::{self, AppCommand};
 use config::{Config, FenceCfg, FenceKind};
 use fence::Fence;
 use tray::{
@@ -262,8 +264,6 @@ const TID_WATCHDOG: usize = 1;
 const TID_SWEEP_RETRY: usize = 3;
 const TID_DOWNLOADS: usize = 4;
 const TID_DESKTOP_LAYER: usize = 5;
-const WM_APP_SWEEP: u32 = WM_APP + 5;
-
 unsafe extern "system" fn msg_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -324,21 +324,8 @@ unsafe extern "system" fn msg_wndproc(
         }
         return LRESULT(0);
     }
-    if msg == WM_APP_SWEEP {
-        with_global(|g| sweep_desktop(g));
-        return LRESULT(0);
-    }
-    // 目录监听按栅栏 id 通知:窗口重建后依然有效(不依赖具体 hwnd)
-    if msg == fence::WM_APP_REFRESH_ID {
-        let id = wparam.0 as u32;
-        with_global(|g| {
-            if let Some(idx) = g.fences.iter().position(|f| f.valid && f.cfg.id == id) {
-                let ghost = g.config.ghost_mode;
-                let f = &mut g.fences[idx];
-                fence::refresh_entries(f, &config::vault_dir(&g.config));
-                fence::render_fence(&mut g.icons, ghost, f);
-            }
-        });
+    if msg == command::WM_APP_DISPATCH {
+        command::drain(dispatch_app_command);
         return LRESULT(0);
     }
     if msg == WM_DESTROY {
@@ -346,6 +333,20 @@ unsafe extern "system" fn msg_wndproc(
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+fn dispatch_app_command(command: AppCommand) {
+    match command {
+        AppCommand::SweepDesktop => with_global(sweep_desktop),
+        AppCommand::RefreshFence { id } => with_global(|g| {
+            if let Some(idx) = g.fences.iter().position(|f| f.valid && f.cfg.id == id) {
+                let ghost = g.config.ghost_mode;
+                let f = &mut g.fences[idx];
+                fence::refresh_entries(f, &config::vault_dir(&g.config));
+                fence::render_fence(&mut g.icons, ghost, f);
+            }
+        }),
+    }
 }
 
 fn dispatch_menu(cmd: u32) {
@@ -448,14 +449,8 @@ fn dispatch_menu(cmd: u32) {
             });
         }
         MENU_SWEEP => {
-            let _ = unsafe {
-                PostMessageW(
-                    Some(with_global(|g| g.msg_hwnd)),
-                    WM_APP_SWEEP,
-                    WPARAM(0),
-                    LPARAM(0),
-                )
-            };
+            let hwnd = with_global(|g| g.msg_hwnd);
+            command::post(hwnd, AppCommand::SweepDesktop);
         }
         MENU_DOWNLOAD_ENABLED => {
             with_global(|g| set_download_enabled(g, !g.config.download_enabled));
@@ -812,14 +807,7 @@ fn main() {
                         .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
                         .unwrap_or_default();
                     if rules.iter().any(|r| r.ext.to_lowercase() == ext) {
-                        unsafe {
-                            let _ = PostMessageW(
-                                Some(HWND(mhwnd as *mut c_void)),
-                                WM_APP_SWEEP,
-                                WPARAM(0),
-                                LPARAM(0),
-                            );
-                        }
+                        command::post(HWND(mhwnd as *mut c_void), AppCommand::SweepDesktop);
                         break;
                     }
                 }
