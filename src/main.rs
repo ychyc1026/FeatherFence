@@ -354,6 +354,23 @@ fn dispatch_app_command(command: AppCommand) {
             hwnd,
             capture_changed,
         } => fence::apply_pointer_cancellation(HWND(hwnd as *mut c_void), capture_changed),
+        AppCommand::ApplyFenceDpiChange {
+            hwnd,
+            dpi,
+            left,
+            top,
+            right,
+            bottom,
+        } => fence::apply_dpi_change(
+            HWND(hwnd as *mut c_void),
+            dpi,
+            windows::Win32::Foundation::RECT {
+                left,
+                top,
+                right,
+                bottom,
+            },
+        ),
     }
 }
 

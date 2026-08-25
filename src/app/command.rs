@@ -10,8 +10,21 @@ pub(crate) const WM_APP_DISPATCH: u32 = WM_APP + 30;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AppCommand {
     SweepDesktop,
-    RefreshFence { id: u32 },
-    CancelFenceInteraction { hwnd: usize, capture_changed: bool },
+    RefreshFence {
+        id: u32,
+    },
+    CancelFenceInteraction {
+        hwnd: usize,
+        capture_changed: bool,
+    },
+    ApplyFenceDpiChange {
+        hwnd: usize,
+        dpi: u32,
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    },
 }
 
 #[derive(Default)]

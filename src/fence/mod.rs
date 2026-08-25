@@ -33,7 +33,7 @@ pub use interaction::{FenceInteraction, ResizeDir};
 pub use model::{Entry, FenceModel};
 pub use refresh::refresh_entries;
 pub use render::{render_fence, start_perf_animation};
-pub(crate) use window::apply_pointer_cancellation;
+pub(crate) use window::{apply_dpi_change, apply_pointer_cancellation};
 pub use window::{create_window, register_class, schedule_render};
 
 pub const WM_APP_REFRESH: u32 = WM_APP + 1;
