@@ -37,9 +37,6 @@ pub use window::{create_window, register_class, schedule_render};
 
 pub const WM_APP_REFRESH: u32 = WM_APP + 1;
 pub const WM_APP_DROP: u32 = WM_APP + 2;
-/// 目录监听按栅栏 id 通知(消息窗口处理,不持有具体 hwnd):
-/// 窗口被 Explorer 销毁重建后 watcher 无需重绑,仍能按 id 找到新窗口
-pub const WM_APP_REFRESH_ID: u32 = WM_APP + 6;
 /// “显示桌面”会尝试最小化所有独立顶层窗口；异步恢复可避免在 WM_SIZE 内递归。
 pub const WM_APP_DESKTOP_RESTORE: u32 = WM_APP + 20;
 

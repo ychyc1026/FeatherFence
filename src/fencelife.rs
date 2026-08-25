@@ -165,12 +165,10 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     let new_idx = g.fences.len() - 1;
     fence::settle_fence(g, new_idx);
 
-    let watcher = watcher::spawn_dir_watcher(watch_dir, move |_names| unsafe {
-        let _ = PostMessageW(
-            Some(HWND(mhwnd as *mut c_void)),
-            fence::WM_APP_REFRESH_ID,
-            WPARAM(fid as usize),
-            LPARAM(0),
+    let watcher = watcher::spawn_dir_watcher(watch_dir, move |_names| {
+        crate::app::command::post(
+            HWND(mhwnd as *mut c_void),
+            crate::app::command::AppCommand::RefreshFence { id: fid },
         );
     });
     g.watchers.push(ManagedWatcher::fence(fid, watcher));
