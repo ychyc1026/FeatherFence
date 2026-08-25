@@ -9,7 +9,6 @@
 // Rust + Win32 原生实现,Fences 轻量版(GPL-3.0,受 Fluid Fences 概念启发,代码为原创)
 mod config;
 mod desktop;
-mod desktop_icons;
 mod download;
 mod dragout;
 mod droptarget;
@@ -477,8 +476,8 @@ fn dispatch_menu(cmd: u32) {
                 } else {
                     // 关闭避让:不回退图标(由「撤销并关闭避让」负责),
                     // 只恢复自动排列样式并清空历史。
-                    desktop_icons::restore_autoarrange();
-                    desktop_icons::clear_history();
+                    desktop::avoidance::restore_autoarrange();
+                    desktop::avoidance::clear_history();
                 }
                 config::save(&g.config);
             });

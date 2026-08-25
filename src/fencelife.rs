@@ -12,8 +12,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 use crate::config::{self, FenceCfg};
+use crate::desktop::avoidance;
 use crate::desktop::host;
-use crate::desktop_icons;
 use crate::download::download_box_should_show;
 use crate::droptarget;
 use crate::fence::{self, Fence, WM_APP_DROP};
@@ -228,15 +228,15 @@ pub(crate) fn reserve_desktop_icons(g: &Global) {
             bottom: f.cfg.y + f.cfg.h,
         })
         .collect();
-    desktop_icons::reserve(&rects);
+    avoidance::reserve(&rects);
 }
 
 /// 「撤销并关闭避让」:把避让期间被搬走的图标写回原位、被移动的栅栏恢复原状,
 /// 然后关闭避让并恢复自动排列样式。
 pub(crate) fn rollback_desktop(g: &mut Global) {
     g.config.desktop_avoid = false; // 先关闭,后续 settle 内部的 reserve 会被 gate 住
-    desktop_icons::rollback_icons();
-    for (id, cfg) in desktop_icons::take_fence_history() {
+    avoidance::rollback_icons();
+    for (id, cfg) in avoidance::take_fence_history() {
         if let Some(idx) = g.fences.iter().position(|f| f.cfg.id == id) {
             // 恢复移动前的几何,再由 settle 磁吸回网格、同步分页并保存
             g.fences[idx].cfg.x = cfg.x;
@@ -246,7 +246,7 @@ pub(crate) fn rollback_desktop(g: &mut Global) {
             fence::settle_fence(g, idx);
         }
     }
-    desktop_icons::restore_autoarrange();
+    avoidance::restore_autoarrange();
     g.config.fences = fence::config_snapshot(&g.fences);
     config::save(&g.config);
 }
