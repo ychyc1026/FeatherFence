@@ -176,20 +176,23 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     id
 }
 
-pub(crate) fn delete_fence(g: &mut Global, idx: usize) {
+pub(crate) fn detach_fence(g: &mut Global, idx: usize) -> Option<fence::Fence> {
     if idx >= g.fences.len() {
-        return;
+        return None;
     }
-    // 先从全局状态移除，DestroyWindow 同步派发 WM_DESTROY 时就不会把条目标成
-    // “意外失效”并被 watchdog 重建。对应监听器在窗口销毁前停止，避免继续投递刷新。
+    // 先从全局状态移除并停止监听；窗口销毁必须在 with_global 之外执行。
     let f = g.fences.remove(idx);
     g.watchers
         .retain(|watcher| watcher.owner != WatcherOwner::Fence(f.cfg.id));
+    sync_config(g);
+    Some(f)
+}
+
+pub(crate) fn destroy_detached_fence(f: fence::Fence) {
     unsafe {
         let _ = windows::Win32::System::Ole::RevokeDragDrop(f.hwnd);
         let _ = DestroyWindow(f.hwnd);
     }
-    sync_config(g);
 }
 pub(crate) fn sync_config(g: &mut Global) {
     g.config.fences = fence::config_snapshot(&g.fences);
