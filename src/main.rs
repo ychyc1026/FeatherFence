@@ -451,8 +451,7 @@ fn dispatch_menu(cmd: u32) {
             });
         }
         MENU_SWEEP => {
-            let hwnd = with_global(|g| g.msg_hwnd);
-            command::post(hwnd, AppCommand::SweepDesktop);
+            command::post(AppCommand::SweepDesktop);
         }
         MENU_DOWNLOAD_ENABLED => {
             with_global(|g| set_download_enabled(g, !g.config.download_enabled));
@@ -636,6 +635,7 @@ fn main() {
         )
         .unwrap_or_default()
     };
+    command::init(msg_hwnd);
 
     fence::register_class();
     dlog("[main] class registered");
@@ -789,7 +789,6 @@ fn main() {
         // 桌面自动归类监听:线程里只做扩展名粗筛,命中就通知主线程执行整理
         if let Some(dir) = desktop_dir() {
             let rules = g.config.sweep_rules.clone();
-            let mhwnd = g.msg_hwnd.0 as usize;
             let tx = desktop_tx.clone();
             let watched_dir = dir.clone();
             let watcher = watcher::spawn_dir_watcher(dir.clone(), move |names| {
@@ -801,7 +800,7 @@ fn main() {
                         .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
                         .unwrap_or_default();
                     if rules.iter().any(|r| r.ext.to_lowercase() == ext) {
-                        command::post(HWND(mhwnd as *mut c_void), AppCommand::SweepDesktop);
+                        command::post(AppCommand::SweepDesktop);
                         break;
                     }
                 }
