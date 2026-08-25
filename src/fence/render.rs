@@ -357,7 +357,7 @@ pub fn render_fence(icons: &mut crate::icons::IconCache, ghost_mode: bool, f: &m
         return;
     }
     // 幽灵态(未悬停):整体 alpha 缩到 16%(逐像素 alpha 直接透出桌面,无需开关背景)。
-    let ghost_active = ghost_mode && !f.hover_visible;
+    let ghost_active = ghost_mode && !f.interaction.hover_visible;
     let bg_alpha = (255.0 * f.cfg.opacity.clamp(0.1, 1.0)) as u8;
     let mut global = 255u8;
     if ghost_active {
@@ -573,7 +573,7 @@ fn paint_core(
                         }
                         let e = &f.model.entries[idx2];
                         let x = margin(d) as f32 + col as f32 * cell_w;
-                        if f.model.selected == Some(idx2) || f.hover == Some(idx2) {
+                        if f.model.selected == Some(idx2) || f.interaction.hover == Some(idx2) {
                             fill_rounded(
                                 gfx,
                                 x - 3.0,

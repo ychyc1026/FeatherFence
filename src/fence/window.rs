@@ -167,13 +167,14 @@ struct CancelledPointerInteraction {
 /// without delivering WM_LBUTTONUP (for example when another window starts a modal action).
 /// Leaving `moving` set in that case makes the fence jump to a later, unrelated mouse move.
 fn reset_pointer_interaction(f: &mut super::Fence) -> CancelledPointerInteraction {
-    let geometry_changed = (f.moving || f.resizing.is_some()) && f.drag_moved;
-    let visual_changed = f.drag_idx.is_some() || f.hover.is_some();
-    f.moving = false;
-    f.resizing = None;
-    f.drag_moved = false;
-    f.drag_idx = None;
-    f.hover = None;
+    let geometry_changed =
+        (f.interaction.moving || f.interaction.resizing.is_some()) && f.interaction.drag_moved;
+    let visual_changed = f.interaction.drag_idx.is_some() || f.interaction.hover.is_some();
+    f.interaction.moving = false;
+    f.interaction.resizing = None;
+    f.interaction.drag_moved = false;
+    f.interaction.drag_idx = None;
+    f.interaction.hover = None;
     CancelledPointerInteraction {
         geometry_changed,
         visual_changed,
@@ -366,7 +367,9 @@ unsafe extern "system" fn fence_wndproc(
                     return false;
                 };
                 let f = &g.fences[idx];
-                let active = f.moving || f.resizing.is_some() || f.drag_idx.is_some();
+                let active = f.interaction.moving
+                    || f.interaction.resizing.is_some()
+                    || f.interaction.drag_idx.is_some();
                 if active && !has_left_button {
                     cancel_pointer_interaction(g, idx, "mouse move without left button");
                     true
@@ -386,8 +389,8 @@ unsafe extern "system" fn fence_wndproc(
                     {
                         let f = &mut g.fences[idx];
                         let d = f.dpi;
-                        if ghost && !f.hover_visible {
-                            f.hover_visible = true;
+                        if ghost && !f.interaction.hover_visible {
+                            f.interaction.hover_visible = true;
                             let mut tme = TRACKMOUSEEVENT {
                                 cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
                                 dwFlags: TRACKMOUSEEVENT_FLAGS(TME_LEAVE.0),
@@ -397,20 +400,20 @@ unsafe extern "system" fn fence_wndproc(
                             let _ = TrackMouseEvent(&mut tme);
                             need_render = true;
                         }
-                        if f.moving {
+                        if f.interaction.moving {
                             let mut cur = POINT::default();
                             let _ = GetCursorPos(&mut cur);
                             // 连续磁吸:平滑拉向最近格点,越近拉得越紧(无瞬移跳变);
                             // 同时 clamp 进工作区,防拖出屏幕
                             let wa = work_area(hwnd);
                             let rx = magnet_smooth(
-                                (cur.x - f.move_off.0) as f32,
+                                (cur.x - f.interaction.move_off.0) as f32,
                                 cell_w(f),
                                 wa.left,
                                 0.5,
                             );
                             let ry = magnet_smooth(
-                                (cur.y - f.move_off.1) as f32,
+                                (cur.y - f.interaction.move_off.1) as f32,
                                 cell_h(f),
                                 wa.top,
                                 0.5,
@@ -432,9 +435,9 @@ unsafe extern "system" fn fence_wndproc(
                             // 否则会用旧的 cfg 位置,把窗口弹回原位
                             f.cfg.x = nx;
                             f.cfg.y = ny;
-                            f.drag_moved = true;
+                            f.interaction.drag_moved = true;
                             // 拖动中不重绘(内容没变;避免每帧全量重绘导致窗口忙/转圈)
-                        } else if let Some(dir) = f.resizing {
+                        } else if let Some(dir) = f.interaction.resizing {
                             let mut cur = POINT::default();
                             let _ = GetCursorPos(&mut cur);
                             let mut rc = RECT::default();
@@ -505,18 +508,20 @@ unsafe extern "system" fn fence_wndproc(
                             f.cfg.h = nh;
                             // 窗口尺寸实时变化 → 页/行重算,顶部行吸附到当前页首
                             sync_page(f);
-                            f.drag_moved = true;
+                            f.interaction.drag_moved = true;
                             need_render = true;
-                        } else if f.drag_idx.is_some() {
+                        } else if f.interaction.drag_idx.is_some() {
                             // 拖出阈值:按下后鼠标移过系统拖拽阈值 → 启动 OLE 拖出。
                             // 实际 DoDragDrop 在 with_global 之外执行(避免持锁进入模态循环)。
                             let t = unsafe {
                                 GetSystemMetrics(SM_CXDRAG).max(GetSystemMetrics(SM_CYDRAG))
                             }
                             .max(4);
-                            if (x - f.drag_down.0).abs() >= t || (y - f.drag_down.1).abs() >= t {
-                                let didx = f.drag_idx.take();
-                                f.hover = None;
+                            if (x - f.interaction.drag_down.0).abs() >= t
+                                || (y - f.interaction.drag_down.1).abs() >= t
+                            {
+                                let didx = f.interaction.drag_idx.take();
+                                f.interaction.hover = None;
                                 if let Some(didx) = didx {
                                     if let Some(p) =
                                         f.model.entries.get(didx).map(|e| e.path.clone())
@@ -534,8 +539,8 @@ unsafe extern "system" fn fence_wndproc(
                             // hover 高亮
                             let (cols, _) = grid_dims(f);
                             let new_hover = hit_item(f, x, y, cols);
-                            if new_hover != f.hover {
-                                f.hover = new_hover;
+                            if new_hover != f.interaction.hover {
+                                f.interaction.hover = new_hover;
                                 need_render = true;
                             }
                         }
@@ -578,31 +583,31 @@ unsafe extern "system" fn fence_wndproc(
                     let avoid = g.config.desktop_avoid;
                     let f = &mut g.fences[idx];
                     // 本按下周期内是否真实移动过(松手时决定要不要 settle)
-                    f.drag_moved = false;
+                    f.interaction.drag_moved = false;
                     if y < title_h(f.dpi) {
                         if avoid {
                             crate::desktop::avoidance::record_fence(&f.cfg);
                         }
-                        f.moving = true;
+                        f.interaction.moving = true;
                         let mut cur = POINT::default();
                         let _ = GetCursorPos(&mut cur);
                         let mut rc = RECT::default();
                         let _ = GetWindowRect(hwnd, &mut rc);
-                        f.move_off = (cur.x - rc.left, cur.y - rc.top);
+                        f.interaction.move_off = (cur.x - rc.left, cur.y - rc.top);
                         SetCapture(hwnd);
                     } else if let Some(dir) = resize_dir_at(f, x, y) {
                         if avoid {
                             crate::desktop::avoidance::record_fence(&f.cfg);
                         }
-                        f.resizing = Some(dir);
+                        f.interaction.resizing = Some(dir);
                         SetCapture(hwnd);
                     } else {
                         // 按在图标上:记录潜在拖出,移动超阈值后由 WM_MOUSEMOVE 启动 OLE 拖拽
                         let (cols, _) = grid_dims(f);
                         if let Some(idx2) = hit_item(f, x, y, cols) {
                             f.model.selected = Some(idx2);
-                            f.drag_idx = Some(idx2);
-                            f.drag_down = (x, y);
+                            f.interaction.drag_idx = Some(idx2);
+                            f.interaction.drag_down = (x, y);
                             SetCapture(hwnd);
                             render_fence(&mut g.icons, ghost, f);
                         } else if f.model.selected.take().is_some() {
@@ -618,14 +623,15 @@ unsafe extern "system" fn fence_wndproc(
                 if let Some(idx) = fence_idx(g, hwnd) {
                     // 仅当真的拖动/缩放移动过才整理吸附;单击标题/边缘不触发
                     // settle(否则点一下标题栅栏就跳到最近格点并改变尺寸)
-                    let was_drag = (g.fences[idx].moving || g.fences[idx].resizing.is_some())
-                        && g.fences[idx].drag_moved;
-                    let had_item_press = g.fences[idx].drag_idx.is_some();
-                    g.fences[idx].moving = false;
-                    g.fences[idx].resizing = None;
-                    g.fences[idx].drag_moved = false;
+                    let was_drag = (g.fences[idx].interaction.moving
+                        || g.fences[idx].interaction.resizing.is_some())
+                        && g.fences[idx].interaction.drag_moved;
+                    let had_item_press = g.fences[idx].interaction.drag_idx.is_some();
+                    g.fences[idx].interaction.moving = false;
+                    g.fences[idx].interaction.resizing = None;
+                    g.fences[idx].interaction.drag_moved = false;
                     // 普通单击(未达拖拽阈值)也会到这里:清除潜在拖出
-                    g.fences[idx].drag_idx = None;
+                    g.fences[idx].interaction.drag_idx = None;
                     if was_drag || had_item_press {
                         let _ = ReleaseCapture();
                     }
@@ -682,12 +688,12 @@ unsafe extern "system" fn fence_wndproc(
                     let ghost = g.config.ghost_mode;
                     let f = &mut g.fences[idx];
                     // 增量先累加,满 120(一次滚轮刻度)翻一页;触控板小增量累积后同样翻页
-                    f.wheel_acc += raw;
-                    let steps = f.wheel_acc / 120;
+                    f.interaction.wheel_acc += raw;
+                    let steps = f.interaction.wheel_acc / 120;
                     if steps == 0 {
                         return;
                     }
-                    f.wheel_acc -= steps * 120;
+                    f.interaction.wheel_acc -= steps * 120;
                     let pages = total_pages(f);
                     let dir = if steps < 0 { 1 } else { -1 };
                     let np = (f.model.page as i32 + dir * steps.abs()).clamp(0, pages as i32 - 1)
@@ -741,8 +747,8 @@ unsafe extern "system" fn fence_wndproc(
                 if let Some(idx) = fence_idx(g, hwnd) {
                     let ghost = g.config.ghost_mode;
                     let f = &mut g.fences[idx];
-                    f.hover_visible = false;
-                    f.hover = None;
+                    f.interaction.hover_visible = false;
+                    f.interaction.hover = None;
                     render_fence(&mut g.icons, ghost, f);
                 }
             });
@@ -867,29 +873,29 @@ mod pointer_interaction_tests {
     #[test]
     fn cancelled_capture_clears_geometry_drag_without_requesting_a_snap() {
         let mut fence = Fence::new(FenceCfg::default(), HWND::default());
-        fence.moving = true;
-        fence.resizing = Some(ResizeDir::SE);
-        fence.drag_moved = true;
+        fence.interaction.moving = true;
+        fence.interaction.resizing = Some(ResizeDir::SE);
+        fence.interaction.drag_moved = true;
 
         let outcome = reset_pointer_interaction(&mut fence);
 
         assert!(outcome.geometry_changed);
-        assert!(!fence.moving);
-        assert!(fence.resizing.is_none());
-        assert!(!fence.drag_moved);
+        assert!(!fence.interaction.moving);
+        assert!(fence.interaction.resizing.is_none());
+        assert!(!fence.interaction.drag_moved);
     }
 
     #[test]
     fn cancelled_capture_clears_pending_item_drag() {
         let mut fence = Fence::new(FenceCfg::default(), HWND::default());
-        fence.drag_idx = Some(3);
-        fence.hover = Some(3);
+        fence.interaction.drag_idx = Some(3);
+        fence.interaction.hover = Some(3);
 
         let outcome = reset_pointer_interaction(&mut fence);
 
         assert!(!outcome.geometry_changed);
         assert!(outcome.visual_changed);
-        assert!(fence.drag_idx.is_none());
-        assert!(fence.hover.is_none());
+        assert!(fence.interaction.drag_idx.is_none());
+        assert!(fence.interaction.hover.is_none());
     }
 }

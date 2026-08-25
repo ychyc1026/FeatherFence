@@ -284,8 +284,8 @@ pub(crate) fn watchdog_tick(g: &mut Global) {
                 g.droptargets.push(it);
                 f.hwnd = hwnd;
                 f.valid = true;
-                f.moving = false;
-                f.resizing = None;
+                f.interaction.moving = false;
+                f.interaction.resizing = None;
                 if g.zen {
                     unsafe {
                         let _ = ShowWindow(hwnd, SW_HIDE);

@@ -53,7 +53,7 @@ pub fn refresh_entries(f: &mut Fence, vault: &PathBuf) {
     }
     f.model.selected = selected_path.and_then(|p| f.model.entries.iter().position(|e| e.path == p));
     f.model.page = page;
-    f.wheel_acc = 0;
+    f.interaction.wheel_acc = 0;
     sync_page(f);
     if let Some(started) = total_started {
         crate::perf::record_refresh(
