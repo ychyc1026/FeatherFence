@@ -352,77 +352,79 @@ fn dispatch_app_command(command: AppCommand) {
 fn dispatch_menu(cmd: u32) {
     match cmd {
         MENU_NEW_PORTAL => {
+            let owner = with_global(|g| g.msg_hwnd);
+            let Some(folder) = pick_folder(owner, "选择栅栏要显示的文件夹") else {
+                return;
+            };
+            let title = folder
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "文件夹栅栏".into());
+            let (sw, _sh) = utils::screen_size();
+            let s = fence::dpi_scale();
             with_global(|g| {
-                if let Some(folder) = pick_folder(g.msg_hwnd, "选择栅栏要显示的文件夹") {
-                    let title = folder
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "文件夹栅栏".into());
-                    let (sw, _sh) = utils::screen_size();
-                    let s = fence::dpi_scale();
-                    // id 传 0,由 create_fence 统一分配并递增 next_id(避免重复 id)
-                    let cfg = FenceCfg {
-                        id: 0,
-                        title,
-                        kind: FenceKind::Portal,
-                        folder: Some(folder),
-                        x: sw - (340.0 * s) as i32,
-                        y: (100.0 * s) as i32 + (g.fences.len() as i32 % 5) * (40.0 * s) as i32,
-                        w: (280.0 * s) as i32,
-                        h: (340.0 * s) as i32,
-                        dpi: (96.0 * s).round() as u32,
-                        opacity: 0.7,
-                        icon: 32,
-                        pos_set: None,
-                    };
-                    create_fence(g, cfg);
-                }
+                // id 传 0,由 create_fence 统一分配并递增 next_id(避免重复 id)
+                let cfg = FenceCfg {
+                    id: 0,
+                    title,
+                    kind: FenceKind::Portal,
+                    folder: Some(folder),
+                    x: sw - (340.0 * s) as i32,
+                    y: (100.0 * s) as i32 + (g.fences.len() as i32 % 5) * (40.0 * s) as i32,
+                    w: (280.0 * s) as i32,
+                    h: (340.0 * s) as i32,
+                    dpi: (96.0 * s).round() as u32,
+                    opacity: 0.7,
+                    icon: 32,
+                    pos_set: None,
+                };
+                create_fence(g, cfg);
             });
         }
         MENU_NEW_BOX => {
-            with_global(|g| {
-                // 每个收纳栅栏 = 新建一个专属空目录(不再共享 vault)。
-                // 目录放 config_dir/boxes/ 下,名字自动取"收纳箱/收纳箱 2/…"去重。
-                let boxes_root = config::config_dir().join("boxes");
-                let dir = {
-                    let mut n = 1u32;
-                    loop {
-                        let name = if n == 1 {
-                            "收纳箱".to_string()
-                        } else {
-                            format!("收纳箱 {}", n)
-                        };
-                        let d = boxes_root.join(&name);
-                        if !d.exists() {
-                            break d;
-                        }
-                        n += 1;
-                    }
-                };
-                if std::fs::create_dir_all(&dir).is_ok() {
-                    let (sw, _sh) = utils::screen_size();
-                    let title = dir
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "收纳箱".into());
-                    // id 传 0,由 create_fence 分配新 id 并递增
-                    let s = fence::dpi_scale();
-                    let cfg = FenceCfg {
-                        id: 0,
-                        title,
-                        kind: FenceKind::Collection,
-                        folder: Some(dir),
-                        x: sw - (320.0 * s) as i32,
-                        y: (100.0 * s) as i32 + (g.fences.len() as i32 % 5) * (40.0 * s) as i32,
-                        w: (260.0 * s) as i32,
-                        h: (340.0 * s) as i32,
-                        dpi: (96.0 * s).round() as u32,
-                        opacity: 0.7,
-                        icon: 32,
-                        pos_set: None,
+            // 文件系统准备不持有 UI 状态；完成后再短暂应用创建结果。
+            let boxes_root = config::config_dir().join("boxes");
+            let dir = {
+                let mut n = 1u32;
+                loop {
+                    let name = if n == 1 {
+                        "收纳箱".to_string()
+                    } else {
+                        format!("收纳箱 {}", n)
                     };
-                    create_fence(g, cfg);
+                    let d = boxes_root.join(&name);
+                    if !d.exists() {
+                        break d;
+                    }
+                    n += 1;
                 }
+            };
+            if std::fs::create_dir_all(&dir).is_err() {
+                return;
+            }
+            let (sw, _sh) = utils::screen_size();
+            let title = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "收纳箱".into());
+            let s = fence::dpi_scale();
+            with_global(|g| {
+                // id 传 0,由 create_fence 分配新 id 并递增
+                let cfg = FenceCfg {
+                    id: 0,
+                    title,
+                    kind: FenceKind::Collection,
+                    folder: Some(dir),
+                    x: sw - (320.0 * s) as i32,
+                    y: (100.0 * s) as i32 + (g.fences.len() as i32 % 5) * (40.0 * s) as i32,
+                    w: (260.0 * s) as i32,
+                    h: (340.0 * s) as i32,
+                    dpi: (96.0 * s).round() as u32,
+                    opacity: 0.7,
+                    icon: 32,
+                    pos_set: None,
+                };
+                create_fence(g, cfg);
             });
         }
         MENU_TOGGLE_VIS => {
