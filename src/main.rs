@@ -185,6 +185,10 @@ pub fn with_global<R>(f: impl FnOnce(&mut Global) -> R) -> R {
     result
 }
 
+pub(crate) fn global_access_active() -> bool {
+    G_DEPTH.with(|depth| depth.get() > 0)
+}
+
 fn desktop_dir() -> Option<PathBuf> {
     known_folder_dir(&FOLDERID_Desktop)
 }
@@ -346,6 +350,10 @@ fn dispatch_app_command(command: AppCommand) {
                 fence::render_fence(&mut g.icons, ghost, f);
             }
         }),
+        AppCommand::CancelFenceInteraction {
+            hwnd,
+            capture_changed,
+        } => fence::apply_pointer_cancellation(HWND(hwnd as *mut c_void), capture_changed),
     }
 }
 

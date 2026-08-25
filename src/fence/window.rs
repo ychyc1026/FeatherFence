@@ -206,6 +206,19 @@ fn cancel_pointer_interaction(g: &mut Global, idx: usize, reason: &str) {
     }
 }
 
+pub(crate) fn apply_pointer_cancellation(hwnd: HWND, capture_changed: bool) {
+    with_global(|g| {
+        if let Some(idx) = fence_idx(g, hwnd) {
+            let reason = if capture_changed {
+                "capture changed"
+            } else {
+                "cancel mode"
+            };
+            cancel_pointer_interaction(g, idx, reason);
+        }
+    });
+}
+
 pub fn schedule_render(hwnd: HWND) {
     // 直接渲染(渲染是纯函数,开销毫秒级)
     with_global(|g| {
@@ -319,16 +332,17 @@ unsafe extern "system" fn fence_wndproc(
             return LRESULT(0);
         }
         WM_CANCELMODE | WM_CAPTURECHANGED => {
-            with_global(|g| {
-                if let Some(idx) = fence_idx(g, hwnd) {
-                    let reason = if msg == WM_CAPTURECHANGED {
-                        "capture changed"
-                    } else {
-                        "cancel mode"
-                    };
-                    cancel_pointer_interaction(g, idx, reason);
-                }
-            });
+            let capture_changed = msg == WM_CAPTURECHANGED;
+            if crate::global_access_active() {
+                crate::app::command::post(
+                    crate::app::command::AppCommand::CancelFenceInteraction {
+                        hwnd: hwnd.0 as usize,
+                        capture_changed,
+                    },
+                );
+            } else {
+                apply_pointer_cancellation(hwnd, capture_changed);
+            }
             return LRESULT(0);
         }
         WM_KEYDOWN if wparam.0 == VK_DELETE.0 as usize => {
