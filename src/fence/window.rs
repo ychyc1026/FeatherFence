@@ -21,12 +21,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, GetCursorPos, GetSystemMetrics, GetWindowRect,
     HTCLIENT, IDC_ARROW, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
     LoadCursorW, PostMessageW, RegisterClassW, SC_MINIMIZE, SIZE_MINIMIZED, SM_CXDRAG, SM_CYDRAG,
-    SW_SHOWNA, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, WM_CANCELMODE,
-    WM_CAPTURECHANGED, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST,
-    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSCOMMAND, WM_TIMER, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
+    SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
+    SetWindowPos, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSCOMMAND,
+    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -85,7 +84,7 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
         let r = CreateWindowExW(
             // 分层窗口 + ULW 整幅提交:逐像素 alpha,半透明面板真透明透出桌面。
             // 圆角由 DWM 裁(DWMWCP_ROUND 对分层窗口同样生效)。
-            // 启动时用 SW_SHOWNA 避免抢焦点；用户点击后允许激活，才能接收 Delete。
+            // 创建时保持隐藏；状态注册和首帧渲染后，由生命周期层定位到桌面层并显示。
             WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             w!("FeatherFence"),
             PCWSTR(title_w.as_ptr()),
@@ -107,24 +106,6 @@ pub fn create_window(cfg: &FenceCfg, parent: Option<HWND>) -> HWND {
             }
         };
         if !hwnd.is_invalid() {
-            // 插到桌面层之上(Progman 之后):栅栏位于桌面背景之上、图标层/普通窗口之下。
-            // 不用 HWND_BOTTOM:实测会把窗口压到 Progman 之下的 DWM 隐藏区域,
-            // 窗口不可见且 FindWindow/EnumWindows 都枚举不到。
-            // 不挂 Progman 作父窗口(分层窗口+高 alpha+Progman 父窗口会触发 DWM
-            // 命中测试 bug,导致窗口可见但点不到拖不动)。
-            if let Some(host) = crate::desktop::host::desktop_insert_host() {
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(host),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
-            // 分层窗口:显示后整幅 ULW 提交(逐像素 alpha,透明面板透出桌面)。
-            let _ = ShowWindow(hwnd, SW_SHOWNA);
             // 圆角由 DWM 裁
             enable_round(hwnd);
             // Fence 尚未注册到 AppState；首帧由 create_fence 完成状态注册后提交。
@@ -316,7 +297,7 @@ unsafe extern "system" fn fence_wndproc(
         WM_APP_DESKTOP_RESTORE => {
             let should_show = with_global(|g| !g.zen && fence_idx(g, hwnd).is_some());
             if should_show {
-                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                crate::desktop::host::show_on_desktop_layer(hwnd);
                 schedule_render(hwnd);
             }
             return LRESULT(0);

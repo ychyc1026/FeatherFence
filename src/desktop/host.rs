@@ -2,7 +2,9 @@
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, FindWindowW, GetClassNameW, SendMessageW,
+    EnumChildWindows, EnumWindows, FindWindowW, GW_HWNDPREV, GetClassNameW, GetWindow, HWND_TOP,
+    IsIconic, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SendMessageW, SetWindowPos, ShowWindow,
 };
 use windows::core::{BOOL, w};
 
@@ -42,6 +44,49 @@ pub(crate) fn desktop_insert_host() -> Option<HWND> {
         FOUND_HOST = None;
         let _ = EnumWindows(Some(enum_host_proc), LPARAM(0));
         FOUND_HOST
+    }
+}
+
+/// 在桌面宿主正上方显示栅栏，不先把它抬到普通应用窗口之上。
+/// 这是所有“从隐藏/最小化恢复”路径的唯一显示边界。
+pub(crate) fn show_on_desktop_layer(hwnd: HWND) -> bool {
+    let Some(host) = desktop_insert_host() else {
+        return false;
+    };
+    show_above_host(hwnd, host)
+}
+
+/// 使用调用方已经验证的桌面宿主显示栅栏。
+pub(crate) fn show_above_host(hwnd: HWND, host: HWND) -> bool {
+    unsafe {
+        // 系统“显示桌面”可能真正最小化独立顶层窗口。先恢复，
+        // 但在同一次消息处理中立即纠正 Z 序，不等后台定时器。
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        let above = GetWindow(host, GW_HWNDPREV).unwrap_or(HWND_TOP);
+        let result = if above == hwnd {
+            SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+            )
+        } else {
+            SetWindowPos(
+                hwnd,
+                Some(above),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        };
+        result.is_ok()
     }
 }
 
