@@ -2,7 +2,6 @@
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::System::Ole::RegisterDragDrop;
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GW_HWNDPREV, GetWindow, GetWindowRect, HWND_TOP, IsIconic, IsWindow,
     IsWindowVisible, PostMessageW, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
@@ -16,7 +15,6 @@ use crate::desktop::host;
 use crate::download::download_box_should_show;
 use crate::fence::{self, Fence, WM_APP_DROP};
 use crate::perf;
-use crate::transfer::drop_target;
 use crate::tray;
 use crate::utils::{self, wstr};
 use crate::watcher;
@@ -62,16 +60,8 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
     if hwnd.is_invalid() {
         return 0;
     }
-    // 注册拖放
-    let dt = drop_target::FenceDropTarget::new(hwnd);
-    let it: windows::Win32::System::Ole::IDropTarget = dt.into();
-    unsafe {
-        let _ = RegisterDragDrop(hwnd, &it);
-    }
-    // 保持 COM 对象存活:塞进全局集合,进程退出时释放
-    g.droptargets.push(it);
-
     let mut f = Fence::new(cfg, hwnd);
+    f.register_drop_target();
     // v3 持久化保留物理屏幕位置,仅按保存时 DPI → 当前窗口 DPI 换算尺寸。
     // 不能用系统 DPI 统一恢复:混合缩放多屏会把副屏窗口漂回主屏坐标。
     let saved_dpi = f.cfg.dpi;
@@ -186,9 +176,9 @@ pub(crate) fn detach_fence(g: &mut Global, idx: usize) -> Option<fence::Fence> {
     Some(f)
 }
 
-pub(crate) fn destroy_detached_fence(f: fence::Fence) {
+pub(crate) fn destroy_detached_fence(mut f: fence::Fence) {
+    f.revoke_drop_target();
     unsafe {
-        let _ = windows::Win32::System::Ole::RevokeDragDrop(f.hwnd);
         let _ = DestroyWindow(f.hwnd);
     }
 }
@@ -273,13 +263,8 @@ pub(crate) fn watchdog_tick(g: &mut Global) {
             // 导致窗口可见但点不到拖不动);改为独立顶层窗口 + 压底 Z 序(同 Fluid Fences 思路)
             let hwnd = fence::create_window(&cfg, None);
             if !hwnd.is_invalid() {
-                let dt = drop_target::FenceDropTarget::new(hwnd);
-                let it: windows::Win32::System::Ole::IDropTarget = dt.into();
-                unsafe {
-                    let _ = RegisterDragDrop(hwnd, &it);
-                }
-                g.droptargets.push(it);
                 f.hwnd = hwnd;
+                f.register_drop_target();
                 f.valid = true;
                 f.interaction.moving = false;
                 f.interaction.resizing = None;

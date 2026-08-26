@@ -87,8 +87,6 @@ pub struct Global {
     pub download_seen: HashSet<PathBuf>,
     pub download_pending: HashMap<PathBuf, FileCandidate>,
     pub exiting: bool,
-    /// 拖放 COM 对象,保持存活
-    pub droptargets: Vec<windows::Win32::System::Ole::IDropTarget>,
     /// 目录监听线程
     pub watchers: Vec<ManagedWatcher>,
 }
@@ -523,7 +521,6 @@ fn dispatch_menu(cmd: u32) {
                 destroy_detached_fence(fence);
             }
             with_global(|g| {
-                g.droptargets.clear();
                 // 与启动恢复一致:重复/缺失 id 重新分配,保证按 id 刷新全部生效
                 let mut seen = std::collections::HashSet::new();
                 for cfg in g.config.fences.clone() {
@@ -714,7 +711,6 @@ fn main() {
             download_seen,
             download_pending: HashMap::new(),
             exiting: false,
-            droptargets: Vec::new(),
             watchers: Vec::new(),
         });
     });
@@ -892,13 +888,6 @@ fn main() {
         // 先停止所有目录监听，确保清理窗口和 COM/GDI+ 后不再有后台通知。
         g.watchers.clear();
         config::save(&g.config);
-        for f in g.fences.iter() {
-            if f.valid {
-                unsafe {
-                    let _ = windows::Win32::System::Ole::RevokeDragDrop(f.hwnd);
-                };
-            }
-        }
     });
     // Global 中的 OLE/GDI 资源必须在对应子系统关闭前析构。
     let global = G.with(|state| state.borrow_mut().take());

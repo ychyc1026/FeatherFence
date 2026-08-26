@@ -236,6 +236,7 @@ pub(crate) fn apply_dpi_change(hwnd: HWND, newdpi: u32, rect: RECT) {
 pub(crate) fn apply_window_destroyed(hwnd: HWND) {
     with_global(|g| {
         if let Some(idx) = fence_idx(g, hwnd) {
+            g.fences[idx].revoke_drop_target();
             g.fences[idx].valid = false;
         }
     });

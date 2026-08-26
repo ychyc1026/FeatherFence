@@ -22,6 +22,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::config::FenceCfg;
+use crate::transfer::drop_target::RegisteredDropTarget;
 
 use refresh::REFRESH_DEBOUNCE_MS;
 use render::RenderCache;
@@ -150,6 +151,8 @@ pub struct Fence {
     pub refresh_signal: RefreshSignal,
     /// 已渲染 DIB 缓存:ULW 整幅提交的源(内容不保留,必须自己存)
     cache: Option<RenderCache>,
+    /// OLE 拖放注册与当前窗口绑定，窗口失效或栅栏销毁时自动注销。
+    drop_target: Option<RegisteredDropTarget>,
     pub valid: bool,
 }
 
@@ -168,7 +171,17 @@ impl Fence {
             interaction: FenceInteraction::default(),
             refresh_signal: RefreshSignal::default(),
             cache: None,
+            drop_target: None,
             valid: true,
         }
+    }
+
+    pub(crate) fn register_drop_target(&mut self) {
+        self.revoke_drop_target();
+        self.drop_target = RegisteredDropTarget::register(self.hwnd).ok();
+    }
+
+    pub(crate) fn revoke_drop_target(&mut self) {
+        self.drop_target = None;
     }
 }
