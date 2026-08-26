@@ -44,6 +44,61 @@ pub(crate) struct RenderCache {
     bits: *mut u8,
     w: i32,
     h: i32,
+    /// `hbmp` 选入内存 DC 前的原位图。删除 `hbmp` 前必须先恢复它。
+    previous_bitmap: HGDIOBJ,
+}
+
+impl RenderCache {
+    fn new(w: i32, h: i32) -> Option<Self> {
+        let mdc = unsafe { CreateCompatibleDC(None) };
+        if mdc.is_invalid() {
+            return None;
+        }
+
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB.0;
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hbmp = match unsafe {
+            CreateDIBSection(Some(mdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+        } {
+            Ok(hbmp) => hbmp,
+            Err(_) => {
+                let _ = unsafe { DeleteDC(mdc) };
+                return None;
+            }
+        };
+
+        let previous_bitmap = unsafe { SelectObject(mdc, HGDIOBJ(hbmp.0)) };
+        if previous_bitmap.is_invalid() {
+            let _ = unsafe { DeleteObject(HGDIOBJ(hbmp.0)) };
+            let _ = unsafe { DeleteDC(mdc) };
+            return None;
+        }
+
+        Some(Self {
+            mdc,
+            hbmp,
+            bits: bits as *mut u8,
+            w,
+            h,
+            previous_bitmap,
+        })
+    }
+}
+
+impl Drop for RenderCache {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SelectObject(self.mdc, self.previous_bitmap);
+            let _ = DeleteObject(HGDIOBJ(self.hbmp.0));
+            let _ = DeleteDC(self.mdc);
+        }
+    }
 }
 
 /// 取/建栅栏的渲染缓存(尺寸匹配则复用,否则重建)。返回像素指针;失败返回 null。
@@ -53,38 +108,7 @@ fn ensure_cache(f: &mut Fence, w: i32, h: i32) -> *mut u8 {
         None => true,
     };
     if need_new {
-        if let Some(c) = f.cache.take() {
-            unsafe {
-                let _ = DeleteObject(HGDIOBJ(c.hbmp.0));
-                let _ = DeleteDC(c.mdc);
-            }
-        }
-        let mdc = unsafe { CreateCompatibleDC(None) };
-        let mut bmi = BITMAPINFO::default();
-        bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = w;
-        bmi.bmiHeader.biHeight = -h;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB.0;
-        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let hbmp = unsafe { CreateDIBSection(Some(mdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) };
-        match hbmp {
-            Ok(b) => {
-                let _ = unsafe { SelectObject(mdc, HGDIOBJ(b.0)) };
-                f.cache = Some(RenderCache {
-                    mdc,
-                    hbmp: b,
-                    bits: bits as *mut u8,
-                    w,
-                    h,
-                });
-            }
-            Err(_) => {
-                let _ = unsafe { DeleteDC(mdc) };
-                f.cache = None;
-            }
-        }
+        f.cache = RenderCache::new(w, h);
     }
     f.cache.as_ref().map_or(std::ptr::null_mut(), |c| c.bits)
 }
@@ -739,4 +763,26 @@ fn paint_core(
             .unwrap_or_default();
     }
     profiling.then_some(sample)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RenderCache;
+    use windows::Win32::System::Threading::{GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources};
+
+    #[test]
+    fn render_cache_does_not_accumulate_gdi_objects() {
+        let process = unsafe { GetCurrentProcess() };
+        let before = unsafe { GetGuiResources(process, GR_GDIOBJECTS) };
+
+        let caches: Vec<_> = (0..32)
+            .map(|_| RenderCache::new(32, 32).expect("GDI render cache should be created"))
+            .collect();
+        let while_alive = unsafe { GetGuiResources(process, GR_GDIOBJECTS) };
+        assert_eq!(while_alive, before + 64);
+
+        drop(caches);
+
+        assert_eq!(unsafe { GetGuiResources(process, GR_GDIOBJECTS) }, before);
+    }
 }
