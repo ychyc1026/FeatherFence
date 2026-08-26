@@ -13,6 +13,7 @@ mod desktop;
 mod download;
 mod fence;
 mod fencelife;
+mod hotkey;
 mod icons;
 mod perf;
 mod shortcut;
@@ -40,22 +41,23 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, RegisterHotKey};
+use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL};
 use windows::Win32::UI::Shell::{
     BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, FOLDERID_Desktop,
     FOLDERID_PublicDesktop, SHBrowseForFolderW, SHGetKnownFolderPath, SHGetPathFromIDListW,
     ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
-    PostQuitMessage, RegisterClassW, TranslateMessage, WM_DESTROY, WM_HOTKEY, WM_QUIT, WM_TIMER,
-    WNDCLASSW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MB_ICONWARNING,
+    MB_OK, PostMessageW, PostQuitMessage, RegisterClassW, TranslateMessage, WM_DESTROY, WM_HOTKEY,
+    WM_QUIT, WM_TIMER, WNDCLASSW, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
 use app::command::{self, AppCommand};
 use config::{Config, FenceCfg, FenceKind};
 use fence::Fence;
+use hotkey::RegisteredHotKey;
 use tray::{
     MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DESKTOP_AVOID, MENU_DESKTOP_ROLLBACK,
     MENU_DOWNLOAD_ENABLED, MENU_DOWNLOAD_VISIBLE, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX,
@@ -87,6 +89,8 @@ pub struct Global {
     pub download_seen: HashSet<PathBuf>,
     pub download_pending: HashMap<PathBuf, FileCandidate>,
     pub exiting: bool,
+    /// 必须在消息窗口销毁前注销的 Zen 全局热键。
+    _zen_hotkey: Option<RegisteredHotKey>,
     /// 目录监听线程
     pub watchers: Vec<ManagedWatcher>,
 }
@@ -253,6 +257,7 @@ const TID_WATCHDOG: usize = 1;
 const TID_SWEEP_RETRY: usize = 3;
 const TID_DOWNLOADS: usize = 4;
 const TID_DESKTOP_LAYER: usize = 5;
+const ZEN_HOTKEY_ID: i32 = 1;
 unsafe extern "system" fn msg_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -293,7 +298,7 @@ unsafe extern "system" fn msg_wndproc(
         }
         return LRESULT(0);
     }
-    if msg == WM_HOTKEY {
+    if msg == WM_HOTKEY && wparam.0 == ZEN_HOTKEY_ID as usize {
         with_global(|g| {
             g.zen = !g.zen;
             apply_visibility(g);
@@ -652,6 +657,29 @@ fn main() {
     };
     command::init(msg_hwnd);
 
+    let zen_hotkey = match RegisteredHotKey::register(
+        msg_hwnd,
+        ZEN_HOTKEY_ID,
+        MOD_CONTROL | MOD_ALT,
+        'Z' as u32,
+    ) {
+        Ok(hotkey) => Some(hotkey),
+        Err(error) => {
+            dlog(&format!("[hotkey] failed to register Ctrl+Alt+Z: {error}"));
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                    Some(msg_hwnd),
+                    w!(
+                        "无法注册全局快捷键 Ctrl+Alt+Z，可能已被其他程序占用。\n仍可通过托盘菜单切换 Zen 模式。"
+                    ),
+                    w!("轻栅栏"),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+            None
+        }
+    };
+
     fence::register_class();
     dlog("[main] class registered");
     let mut cfg = config::load();
@@ -711,6 +739,7 @@ fn main() {
             download_seen,
             download_pending: HashMap::new(),
             exiting: false,
+            _zen_hotkey: zen_hotkey,
             watchers: Vec::new(),
         });
     });
@@ -719,11 +748,6 @@ fn main() {
     let ticon = make_tray_icon();
     add_tray(msg_hwnd, ticon);
     dlog("[main] tray ok");
-
-    // 热键 Ctrl+Alt+Z = Zen
-    unsafe {
-        let _ = RegisterHotKey(Some(msg_hwnd), 1, MOD_CONTROL | MOD_ALT, 'Z' as u32);
-    }
 
     // 定时器
     unsafe {
