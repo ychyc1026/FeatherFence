@@ -10,6 +10,7 @@ use windows::Win32::System::Ole::CF_HDROP;
 use windows::Win32::System::Ole::ReleaseStgMedium;
 use windows::Win32::System::Ole::{
     DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl,
+    RegisterDragDrop, RevokeDragDrop,
 };
 use windows::Win32::System::SystemServices::{MK_CONTROL, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
@@ -28,6 +29,29 @@ impl FenceDropTarget {
             hwnd,
             accepts: Cell::new(false),
         }
+    }
+}
+
+/// 将一次 OLE 拖放注册绑定到对应窗口资源的生命周期。
+pub(crate) struct RegisteredDropTarget {
+    hwnd: HWND,
+    _target: IDropTarget,
+}
+
+impl RegisteredDropTarget {
+    pub(crate) fn register(hwnd: HWND) -> Result<Self> {
+        let target: IDropTarget = FenceDropTarget::new(hwnd).into();
+        unsafe { RegisterDragDrop(hwnd, &target)? };
+        Ok(Self {
+            hwnd,
+            _target: target,
+        })
+    }
+}
+
+impl Drop for RegisteredDropTarget {
+    fn drop(&mut self) {
+        let _ = unsafe { RevokeDragDrop(self.hwnd) };
     }
 }
 
@@ -236,8 +260,30 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
 }
 
 #[cfg(test)]
-mod effect_tests {
+mod tests {
     use super::*;
+    use windows::Win32::Foundation::DRAGDROP_E_ALREADYREGISTERED;
+    use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_POPUP,
+    };
+    use windows::core::PCWSTR;
+
+    struct OleGuard;
+
+    impl Drop for OleGuard {
+        fn drop(&mut self) {
+            unsafe { OleUninitialize() };
+        }
+    }
+
+    struct WindowGuard(HWND);
+
+    impl Drop for WindowGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
 
     #[test]
     fn ctrl_prefers_copy_and_plain_drag_prefers_move() {
@@ -257,5 +303,43 @@ mod effect_tests {
             pick_effect(DROPEFFECT_COPY, MODIFIERKEYS_FLAGS::default()),
             DROPEFFECT_COPY
         );
+    }
+
+    #[test]
+    fn registered_drop_target_revokes_before_releasing_its_target() {
+        unsafe { OleInitialize(None) }.expect("test thread should initialize OLE");
+        let _ole = OleGuard;
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                PCWSTR::null(),
+                WS_POPUP,
+                0,
+                0,
+                32,
+                32,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("test window should be created");
+        let _window = WindowGuard(hwnd);
+
+        let registration =
+            RegisteredDropTarget::register(hwnd).expect("first registration should succeed");
+        let duplicate = match RegisteredDropTarget::register(hwnd) {
+            Ok(_) => panic!("the same window must not accept a second registration"),
+            Err(error) => error,
+        };
+        assert_eq!(duplicate.code(), DRAGDROP_E_ALREADYREGISTERED);
+
+        drop(registration);
+
+        let replacement = RegisteredDropTarget::register(hwnd)
+            .expect("dropping the owner should revoke the previous registration");
+        drop(replacement);
     }
 }
