@@ -5,8 +5,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::System::Ole::RegisterDragDrop;
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GW_HWNDPREV, GetWindow, GetWindowRect, HWND_TOP, IsIconic, IsWindow,
-    IsWindowVisible, PostMessageW, SW_HIDE, SW_SHOWNA, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, ShowWindow,
+    IsWindowVisible, PostMessageW, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SetWindowPos, ShowWindow,
 };
 use windows::core::{PCWSTR, w};
 
@@ -159,6 +159,9 @@ pub(crate) fn create_fence(g: &mut Global, mut cfg: FenceCfg) -> u32 {
         .unwrap_or_else(|| config::vault_dir(&g.config));
     let fid = id;
     g.fences.push(f);
+    if !g.zen && download_box_should_show(g, id) {
+        host::show_on_desktop_layer(hwnd);
+    }
     // 新栅栏立即落到网格:尺寸/位置吸附 + clamp 工作区 + 消除重叠
     let new_idx = g.fences.len() - 1;
     fence::settle_fence(g, new_idx);
@@ -202,8 +205,8 @@ pub(crate) fn apply_visibility(g: &mut Global) {
         unsafe {
             if g.zen || !download_box_should_show(g, f.cfg.id) {
                 let _ = ShowWindow(f.hwnd, SW_HIDE);
-            } else {
-                let _ = ShowWindow(f.hwnd, SW_SHOWNA);
+            } else if !IsWindowVisible(f.hwnd).as_bool() || IsIconic(f.hwnd).as_bool() {
+                host::show_on_desktop_layer(f.hwnd);
             }
         }
     }
@@ -259,9 +262,7 @@ pub(crate) fn watchdog_tick(g: &mut Global) {
             let hidden_or_minimized =
                 unsafe { IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool() };
             if hidden_or_minimized {
-                unsafe {
-                    let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
-                }
+                host::show_on_desktop_layer(f.hwnd);
                 fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
             }
         }
@@ -290,23 +291,8 @@ pub(crate) fn watchdog_tick(g: &mut Global) {
                 // watcher 仍挂在 f 上且按栅栏 id 通知,新窗口自动恢复实时刷新
                 fence::refresh_entries(f, &config::vault_dir(&g.config));
                 fence::render_fence(&mut g.icons, g.config.ghost_mode, f);
-            }
-        }
-        // 周期回位:任何原因把栅栏从桌面层顶起时,3s 内插回桌面层之上。
-        // 用 desktop_insert_host(Progman 之后)而非 HWND_BOTTOM ——
-        // HWND_BOTTOM 会把窗口压进 Progman 之下的 DWM 隐藏区域(不可见)。
-        if f.valid {
-            if let Some(host) = host::desktop_insert_host() {
-                unsafe {
-                    let _ = SetWindowPos(
-                        f.hwnd,
-                        Some(host),
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
+                if !g.zen && !intentionally_hidden {
+                    host::show_on_desktop_layer(hwnd);
                 }
             }
         }
@@ -336,7 +322,7 @@ pub(crate) fn desktop_layer_tick(g: &mut Global) {
     {
         unsafe {
             if IsIconic(f.hwnd).as_bool() || !IsWindowVisible(f.hwnd).as_bool() {
-                let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
+                host::show_above_host(f.hwnd, host);
             }
             let above = GetWindow(anchor, GW_HWNDPREV).unwrap_or(HWND_TOP);
             if above != f.hwnd {
