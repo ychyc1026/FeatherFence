@@ -56,29 +56,52 @@ fn copy_file_new(src: &Path, dest: &Path) -> Result<(), String> {
         .create_new(true)
         .open(dest)
         .map_err(|e| e.to_string())?;
-    std::io::copy(&mut source, &mut target).map_err(|e| e.to_string())?;
-    target.sync_all().map_err(|e| e.to_string())?;
-    if let Ok(metadata) = source.metadata() {
-        std::fs::set_permissions(dest, metadata.permissions()).map_err(|e| e.to_string())?;
+    let result = (|| -> std::io::Result<()> {
+        std::io::copy(&mut source, &mut target)?;
+        target.sync_all()?;
+        if let Ok(metadata) = source.metadata() {
+            std::fs::set_permissions(dest, metadata.permissions())?;
+        }
+        Ok(())
+    })();
+    drop(target);
+    if let Err(error) = result {
+        return match std::fs::remove_file(dest) {
+            Ok(()) => Err(error.to_string()),
+            Err(cleanup_error) => Err(format!(
+                "{error}；无法清理本次创建的目标文件：{cleanup_error}"
+            )),
+        };
     }
     Ok(())
 }
 
 fn copy_dir_tree(src: &Path, dest: &Path) -> Result<(), String> {
     std::fs::create_dir(dest).map_err(|e| e.to_string())?;
-    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let source = entry.path();
-        let target = dest.join(entry.file_name());
-        let kind = entry.file_type().map_err(|e| e.to_string())?;
-        if kind.is_dir() {
-            copy_dir_tree(&source, &target)?;
-        } else {
-            copy_file_new(&source, &target)?;
+    let result = (|| -> Result<(), String> {
+        for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let source = entry.path();
+            let target = dest.join(entry.file_name());
+            let kind = entry.file_type().map_err(|e| e.to_string())?;
+            if kind.is_dir() {
+                copy_dir_tree(&source, &target)?;
+            } else {
+                copy_file_new(&source, &target)?;
+            }
         }
-    }
-    if let Ok(metadata) = std::fs::metadata(src) {
-        std::fs::set_permissions(dest, metadata.permissions()).map_err(|e| e.to_string())?;
+        if let Ok(metadata) = std::fs::metadata(src) {
+            std::fs::set_permissions(dest, metadata.permissions()).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        return match std::fs::remove_dir_all(dest) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(format!(
+                "{error}；无法清理本次创建的目标目录：{cleanup_error}"
+            )),
+        };
     }
     Ok(())
 }
@@ -95,15 +118,7 @@ pub fn copy_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
     } else {
         copy_file_new(src, &dest)
     };
-    if let Err(error) = result {
-        // `dest` was chosen as a unique name and created only by this copy attempt.
-        if dest.is_dir() {
-            let _ = std::fs::remove_dir_all(&dest);
-        } else {
-            let _ = std::fs::remove_file(&dest);
-        }
-        return Err(error);
-    }
+    result?;
     Ok(dest)
 }
 
@@ -161,7 +176,7 @@ pub fn unique_dest(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_then_remove_file, copy_to_dir};
+    use super::{copy_dir_tree, copy_file_new, copy_then_remove_file, copy_to_dir};
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::os::windows::fs::OpenOptionsExt;
@@ -253,6 +268,41 @@ mod tests {
         assert_eq!(
             std::fs::read(copied.join("nested").join("file.txt")).unwrap(),
             b"content"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copy_file_never_deletes_a_destination_it_did_not_create() {
+        let dir = test_dir();
+        let src = dir.join("source.txt");
+        let dest = dir.join("raced.txt");
+        std::fs::write(&src, b"source content").unwrap();
+        std::fs::write(&dest, b"other process content").unwrap();
+
+        let error = copy_file_new(&src, &dest).unwrap_err();
+
+        assert!(!error.is_empty());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"other process content");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copy_directory_never_deletes_a_destination_it_did_not_create() {
+        let dir = test_dir();
+        let src = dir.join("source");
+        let dest = dir.join("raced");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("source.txt"), b"source content").unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("other.txt"), b"other process content").unwrap();
+
+        let error = copy_dir_tree(&src, &dest).unwrap_err();
+
+        assert!(!error.is_empty());
+        assert_eq!(
+            std::fs::read(dest.join("other.txt")).unwrap(),
+            b"other process content"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
