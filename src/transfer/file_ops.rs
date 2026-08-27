@@ -1,4 +1,23 @@
+use std::fs::Metadata;
 use std::path::{Path, PathBuf};
+
+fn source_metadata_without_link(path: &Path) -> Result<Metadata, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "检测到文件系统链接（符号链接、目录联接等），为避免跟随到源目录树之外，已停止：{}",
+            path.display()
+        ));
+    }
+    Ok(metadata)
+}
+
+fn destination_name_is_available(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => false,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
 
 /// 跨卷移动文件：先复制，再删除源文件。
 ///
@@ -9,6 +28,8 @@ fn copy_then_remove_file(
     dest: &Path,
     rename_error: &std::io::Error,
 ) -> Result<(), String> {
+    source_metadata_without_link(src)
+        .map_err(|error| format!("重命名失败：{rename_error}；无法执行跨磁盘复制：{error}"))?;
     let mut destination_created = false;
     let copy_result = (|| -> std::io::Result<()> {
         let mut source = std::fs::File::open(src)?;
@@ -50,6 +71,7 @@ fn copy_then_remove_file(
 }
 
 fn copy_file_new(src: &Path, dest: &Path) -> Result<(), String> {
+    source_metadata_without_link(src)?;
     let mut source = std::fs::File::open(src).map_err(|e| e.to_string())?;
     let mut target = std::fs::OpenOptions::new()
         .write(true)
@@ -77,22 +99,21 @@ fn copy_file_new(src: &Path, dest: &Path) -> Result<(), String> {
 }
 
 fn copy_dir_tree(src: &Path, dest: &Path) -> Result<(), String> {
+    let source_metadata = source_metadata_without_link(src)?;
     std::fs::create_dir(dest).map_err(|e| e.to_string())?;
     let result = (|| -> Result<(), String> {
         for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let source = entry.path();
             let target = dest.join(entry.file_name());
-            let kind = entry.file_type().map_err(|e| e.to_string())?;
-            if kind.is_dir() {
+            let metadata = source_metadata_without_link(&source)?;
+            if metadata.is_dir() {
                 copy_dir_tree(&source, &target)?;
             } else {
                 copy_file_new(&source, &target)?;
             }
         }
-        if let Ok(metadata) = std::fs::metadata(src) {
-            std::fs::set_permissions(dest, metadata.permissions()).map_err(|e| e.to_string())?;
-        }
+        std::fs::set_permissions(dest, source_metadata.permissions()).map_err(|e| e.to_string())?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -107,13 +128,15 @@ fn copy_dir_tree(src: &Path, dest: &Path) -> Result<(), String> {
 }
 
 /// 复制项目到目标目录，保留源项目，并像 Explorer 一样为重名目标生成新名称。
+/// 文件系统链接和目录联接不会被跟随复制；遇到后回滚本次创建的目标树并明确报错。
 pub fn copy_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
     if !dest_dir.exists() {
         std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
     }
     let name = src.file_name().ok_or("no file name")?.to_os_string();
     let dest = unique_dest(dest_dir, &name);
-    let result = if src.is_dir() {
+    let metadata = source_metadata_without_link(src)?;
+    let result = if metadata.is_dir() {
         copy_dir_tree(src, &dest)
     } else {
         copy_file_new(src, &dest)
@@ -123,6 +146,7 @@ pub fn copy_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// 移动项目到目标目录（同卷 rename，跨卷文件 copy+delete），自动避免重名。
+/// 同卷 rename 可原样移动链接；跨卷回退不会把链接转换成其目标内容。
 pub fn move_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
     if !dest_dir.exists() {
         std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
@@ -132,9 +156,12 @@ pub fn move_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
     match std::fs::rename(src, &dest) {
         Ok(()) => Ok(dest),
         Err(rename_error) => {
+            let metadata = source_metadata_without_link(src).map_err(|error| {
+                format!("重命名失败：{rename_error}；无法执行跨磁盘移动：{error}")
+            })?;
             // std::fs::copy 不支持目录。目录同卷可由 rename 完成；跨卷失败时明确报错，
             // 交给上层提示用户，不做可能产生半成品的递归复制。
-            if src.is_dir() {
+            if metadata.is_dir() {
                 return Err(format!(
                     "无法移动文件夹：{rename_error}；暂不支持跨磁盘移动文件夹"
                 ));
@@ -148,7 +175,7 @@ pub fn move_to_dir(src: &Path, dest_dir: &Path) -> Result<PathBuf, String> {
 /// 目标已存在则加 "(1)"/"(2)" 后缀
 pub fn unique_dest(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
     let cand = dir.join(name);
-    if !cand.exists() {
+    if destination_name_is_available(&cand) {
         return cand;
     }
     let stem = Path::new(name)
@@ -161,7 +188,7 @@ pub fn unique_dest(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
         .unwrap_or_default();
     for i in 1..1000 {
         let c = dir.join(format!("{stem} ({i}){ext}"));
-        if !c.exists() {
+        if destination_name_is_available(&c) {
             return c;
         }
     }
@@ -176,13 +203,18 @@ pub fn unique_dest(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_dir_tree, copy_file_new, copy_then_remove_file, copy_to_dir};
+    use super::{
+        copy_dir_tree, copy_file_new, copy_then_remove_file, copy_to_dir, move_to_dir, unique_dest,
+    };
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::path::PathBuf;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt, symlink_dir};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
     fn test_dir() -> PathBuf {
         let nonce = SystemTime::now()
@@ -195,6 +227,30 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn create_directory_reparse_point(target: &Path, link: &Path) {
+        match symlink_dir(target, link) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                let output = Command::new("cmd")
+                    .args(["/d", "/c", "mklink", "/J"])
+                    .arg(link)
+                    .arg(target)
+                    .output()
+                    .expect("cmd should create the test junction");
+                assert!(
+                    output.status.success(),
+                    "failed to create test junction: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(error) => panic!("failed to create test symlink: {error}"),
+        }
     }
 
     #[test]
@@ -304,6 +360,94 @@ mod tests {
             std::fs::read(dest.join("other.txt")).unwrap(),
             b"other process content"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copy_rejects_a_nested_directory_reparse_point_without_following_it() {
+        let dir = test_dir();
+        let source = dir.join("source");
+        let outside = dir.join("outside");
+        let destination = dir.join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("outside.txt"), b"must not be copied").unwrap();
+        let linked = source.join("linked");
+        create_directory_reparse_point(&outside, &linked);
+
+        let error = copy_to_dir(&source, &destination).unwrap_err();
+
+        assert!(error.contains("文件系统链接"));
+        assert!(error.contains("linked"));
+        assert!(!destination.join("source").exists());
+        assert_eq!(
+            std::fs::read(outside.join("outside.txt")).unwrap(),
+            b"must not be copied"
+        );
+        std::fs::remove_dir(linked).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_volume_move_preserves_a_directory_reparse_point() {
+        let dir = test_dir();
+        let target = dir.join("target");
+        let source = dir.join("source-link");
+        let destination = dir.join("destination");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("target.txt"), b"target content").unwrap();
+        create_directory_reparse_point(&target, &source);
+
+        let moved = move_to_dir(&source, &destination).unwrap();
+
+        assert!(!source.exists());
+        assert_ne!(
+            std::fs::symlink_metadata(&moved).unwrap().file_attributes()
+                & FILE_ATTRIBUTE_REPARSE_POINT.0,
+            0
+        );
+        assert_eq!(
+            std::fs::read(target.join("target.txt")).unwrap(),
+            b"target content"
+        );
+        std::fs::remove_dir(moved).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cross_volume_copy_fallback_rejects_a_reparse_point() {
+        let dir = test_dir();
+        let target = dir.join("target");
+        let source = dir.join("source-link");
+        let destination = dir.join("copied-link");
+        std::fs::create_dir(&target).unwrap();
+        create_directory_reparse_point(&target, &source);
+        let rename_error = std::io::Error::other("forced cross-volume fallback");
+
+        let error = copy_then_remove_file(&source, &destination, &rename_error).unwrap_err();
+
+        assert!(error.contains("跨磁盘复制"));
+        assert!(error.contains("文件系统链接"));
+        assert!(std::fs::symlink_metadata(&source).is_ok());
+        assert!(std::fs::symlink_metadata(&destination).is_err());
+        std::fs::remove_dir(source).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn broken_reparse_point_name_is_treated_as_occupied() {
+        let dir = test_dir();
+        let target = dir.join("target");
+        let link = dir.join("item");
+        std::fs::create_dir(&target).unwrap();
+        create_directory_reparse_point(&target, &link);
+        std::fs::remove_dir(&target).unwrap();
+
+        assert_eq!(
+            unique_dest(&dir, std::ffi::OsStr::new("item")),
+            dir.join("item (1)")
+        );
+        std::fs::remove_dir(link).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
