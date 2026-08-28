@@ -31,6 +31,7 @@ use render::RenderCache;
 pub use geometry::{dpi_scale, min_h, min_w, set_icon_px, set_title_font_px, window_dpi};
 pub use grid::{config_snapshot, settle_fence};
 pub use interaction::{FenceInteraction, ResizeDir};
+pub(crate) use menu::prompt_text;
 pub use model::{Entry, FenceModel};
 pub use refresh::refresh_entries;
 pub use render::{render_fence, start_perf_animation};

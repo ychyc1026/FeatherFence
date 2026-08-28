@@ -46,7 +46,7 @@ src/
 │  └─ file_ops.rs           # 复制、移动、重名、回滚和链接策略
 ├─ fencelife.rs             # 栅栏创建/删除/重建、可见性及拖入业务流程
 ├─ config.rs                # 配置模型、迁移、原子保存、备份和恢复
-├─ hotkey.rs                # 全局热键注册所有权
+├─ hotkey.rs                # 全局热键解析、注册与所有权
 ├─ icons.rs                 # Shell 图标抽取和 LRU 缓存
 ├─ watcher.rs               # ReadDirectoryChangesW 监听器
 ├─ shortcut.rs              # 桌面快捷方式自动收纳
