@@ -561,16 +561,21 @@ unsafe extern "system" fn fence_wndproc(
                             {
                                 let didx = f.interaction.drag_idx.take();
                                 f.interaction.hover = None;
-                                if let Some(didx) = didx {
-                                    if let Some(p) =
-                                        f.model.entries.get(didx).map(|e| e.path.clone())
-                                    {
-                                        unsafe {
-                                            let _ = ReleaseCapture();
-                                        };
-                                        let vault = crate::config::vault_dir(&g.config);
-                                        drag_path = Some((p.to_string_lossy().to_string(), vault));
-                                    }
+                                if let Some(didx) = didx
+                                    && didx < f.model.entries.len()
+                                {
+                                    // 先提交不含源条目的画面，再进入 OLE 模态循环。释放时
+                                    // 才隐藏会和 Explorer Drop/目录通知竞争，造成短暂重复。
+                                    let p = f.model.entries.remove(didx).path;
+                                    let keep_page = f.model.page;
+                                    f.model.selected = None;
+                                    f.model.page = keep_page.min(total_pages(f).saturating_sub(1));
+                                    f.top_row = f.model.page as f32 * grid_dims(f).1 as f32;
+                                    unsafe {
+                                        let _ = ReleaseCapture();
+                                    };
+                                    let vault = crate::config::vault_dir(&g.config);
+                                    drag_path = Some((p.to_string_lossy().to_string(), vault));
                                 }
                                 need_render = true;
                             }
@@ -591,22 +596,69 @@ unsafe extern "system" fn fence_wndproc(
             });
             // 在锁外启动 OLE 拖出(阻塞到松手);拖出后文件可能被移动/删除 → 重扫目录刷新
             if let Some((path, vault)) = drag_path {
+                crate::dlog(&format!("[dragout] source hidden before OLE: {path}"));
+                let source_path = Path::new(&path);
+                let desktop_name_absent =
+                    crate::desktop::drop_position::desktop_name_was_absent(source_path);
+                let allow_desktop_move_fast_path =
+                    crate::desktop::drop_position::desktop_move_fast_path_allowed(source_path);
                 let shortcut_dragout = crate::shortcut::begin_shortcut_dragout(Path::new(&path));
-                crate::transfer::drag_source::start_drag(vec![path]);
+                let drag_result = crate::transfer::drag_source::start_drag(
+                    vec![path.clone()],
+                    allow_desktop_move_fast_path,
+                );
+                let desktop_position_queued = if drag_result.effect.0 != 0
+                    && desktop_name_absent
+                    && drag_result
+                        .release_point
+                        .is_some_and(crate::desktop::drop_position::is_desktop_drop_point)
+                {
+                    crate::desktop::drop_position::queue(
+                        source_path,
+                        drag_result.release_point.expect("release point checked"),
+                        drag_result.desktop_visual_lock,
+                    )
+                } else {
+                    false
+                };
+                if drag_result.desktop_visual_lock != 0 && !desktop_position_queued {
+                    crate::desktop::drop_position::finish_desktop_visual_lock(
+                        drag_result.desktop_visual_lock,
+                    );
+                }
                 if shortcut_dragout {
                     crate::shortcut::finish_shortcut_dragout();
                 }
-                with_global(|g| {
-                    if let Some(idx) = fence_idx(g, hwnd) {
-                        let f = &mut g.fences[idx];
-                        let keep_page = f.model.page;
-                        refresh_entries(f, &vault);
-                        // 拖出后尽量留在原页(条目减少时收敛到最后一页)
-                        f.model.page = keep_page.min(total_pages(f).saturating_sub(1));
-                        f.top_row = f.model.page as f32 * grid_dims(f).1 as f32;
-                        render_fence(&mut g.icons, g.config.ghost_mode, f);
+                if drag_result.desktop_drop_defer_refresh {
+                    // Explorer 可能异步完成优化 MOVE。此时立即扫源目录会把刚隐藏的条目
+                    // 短暂加回来；让目录通知正常刷新，并保留一次有界兜底校验以恢复失败落下。
+                    let scheduled = with_global(|g| {
+                        let Some(idx) = fence_idx(g, hwnd) else {
+                            return false;
+                        };
+                        g.fences[idx].refresh_signal.defer();
+                        restart_refresh_timer(hwnd, 1_000)
+                    });
+                    if !scheduled {
+                        with_global(|g| {
+                            if let Some(idx) = fence_idx(g, hwnd) {
+                                refresh_fence_now(g, idx);
+                            }
+                        });
                     }
-                });
+                } else {
+                    with_global(|g| {
+                        if let Some(idx) = fence_idx(g, hwnd) {
+                            let f = &mut g.fences[idx];
+                            let keep_page = f.model.page;
+                            refresh_entries(f, &vault);
+                            // 拖出后尽量留在原页(条目减少时收敛到最后一页)
+                            f.model.page = keep_page.min(total_pages(f).saturating_sub(1));
+                            f.top_row = f.model.page as f32 * grid_dims(f).1 as f32;
+                            render_fence(&mut g.icons, g.config.ghost_mode, f);
+                        }
+                    });
+                }
             }
             return LRESULT(0);
         }

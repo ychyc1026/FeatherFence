@@ -363,6 +363,9 @@ fn format_drop_failures(
 
 /// 处理拖入并返回是否至少复制/移动了一个项目，供 OLE 向数据源报告真实结果。
 pub(crate) fn handle_drop(hwnd: HWND, paths: Vec<String>, copy_requested: bool) -> bool {
+    if !copy_requested {
+        crate::desktop::drop_position::save_view_state_before_desktop_move(&paths);
+    }
     let result = with_global(|g| {
         let Some(idx) = g.fences.iter().position(|f| f.valid && f.hwnd == hwnd) else {
             return None;

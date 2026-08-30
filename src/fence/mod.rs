@@ -113,6 +113,14 @@ impl RefreshSignal {
         }
     }
 
+    /// 标记需要刷新但不立即投递消息；调用方负责设置一次有界计时器。
+    fn defer(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_event(Instant::now());
+    }
+
     fn timer_action(&self) -> RefreshTimerAction {
         self.state
             .lock()

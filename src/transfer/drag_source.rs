@@ -4,13 +4,15 @@
 // 目标端(桌面/文件夹窗口/其他栅栏)负责实际移动文件;拖回本栅栏由现有
 // drop target 接住(文件已在自身目录则跳过 → 无操作)。
 use std::cell::Cell;
+use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, E_INVALIDARG, E_NOTIMPL,
-    E_UNEXPECTED, GlobalFree, HGLOBAL, POINT, S_FALSE, S_OK,
+    E_UNEXPECTED, GlobalFree, HGLOBAL, HWND, POINT, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{
     DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC,
@@ -20,10 +22,11 @@ use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::{
     CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, DoDragDrop,
-    IDropSource, IDropSource_Impl, ReleaseStgMedium,
+    IDropSource, IDropSource_Impl, IDropSourceNotify, IDropSourceNotify_Impl, ReleaseStgMedium,
 };
-use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
-use windows::Win32::UI::Shell::{CFSTR_PERFORMEDDROPEFFECT, DROPFILES};
+use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS};
+use windows::Win32::UI::Shell::{CFSTR_PERFORMEDDROPEFFECT, CFSTR_SHELLIDLISTOFFSET, DROPFILES};
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::core::{BOOL, Error, HRESULT, Ref, Result, implement};
 
 /// DATA_E_FORMATETC:请求的格式不是 CF_HDROP
@@ -39,17 +42,48 @@ fn final_drop_effect(ole_effect: DROPEFFECT, shell_reported: u32) -> DROPEFFECT 
     DROPEFFECT(bits & allowed)
 }
 
-/// 拖出指定路径:阻塞到拖拽结束。返回实际拖放效果(MOVE/COPY/NONE)。
-pub fn start_drag(paths: Vec<String>) -> DROPEFFECT {
+fn desktop_move_fast_path_modifiers_allowed(keys: MODIFIERKEYS_FLAGS) -> bool {
+    keys.0 == 0 || keys.0 == MK_SHIFT.0
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DragResult {
+    pub effect: DROPEFFECT,
+    /// 松开左键时的物理屏幕坐标；仅供落点所属目标确认后使用。
+    pub release_point: Option<POINT>,
+    /// 桌面空白处的安全同卷 MOVE 已成功交给 Explorer；源目录刷新应等待通知。
+    pub desktop_drop_defer_refresh: bool,
+    /// 非零表示桌面 ListView 绘制已锁定，调用方必须交给定位任务或立即释放。
+    pub desktop_visual_lock: u64,
+}
+
+/// 拖出指定路径:阻塞到拖拽结束。返回实际拖放效果和准确的鼠标释放坐标。
+pub fn start_drag(paths: Vec<String>, allow_desktop_move_fast_path: bool) -> DragResult {
     crate::dlog(&format!("[dragout] start drag: {}", paths.join("; ")));
     unsafe {
+        let mut drag_origin = POINT::default();
+        let _ = GetCursorPos(&mut drag_origin);
         let performed_effect = Arc::new(AtomicU32::new(DROPEFFECT_NONE.0));
+        let release_point = Arc::new(OnceLock::new());
+        let shell_offsets_requested = Arc::new(AtomicBool::new(false));
         let dataobj: IDataObject = FileDataObject {
             paths,
             performed_effect: Arc::clone(&performed_effect),
+            release_point: Arc::clone(&release_point),
+            drag_origin,
+            shell_offsets_requested: Arc::clone(&shell_offsets_requested),
         }
         .into();
-        let src: IDropSource = FileDropSource.into();
+        let desktop_drop_defer_refresh = Arc::new(AtomicBool::new(false));
+        let desktop_visual_lock = Arc::new(AtomicU64::new(0));
+        let src: IDropSource = FileDropSource {
+            release_point: Arc::clone(&release_point),
+            desktop_drop_defer_refresh: Arc::clone(&desktop_drop_defer_refresh),
+            allow_desktop_move_fast_path,
+            current_target: AtomicUsize::new(0),
+            desktop_visual_lock: Arc::clone(&desktop_visual_lock),
+        }
+        .into();
         let mut effect = DROPEFFECT_NONE;
         let hr = DoDragDrop(
             &dataobj,
@@ -59,6 +93,9 @@ pub fn start_drag(paths: Vec<String>) -> DROPEFFECT {
         );
         // 诊断:hr 里能看到 E_UNEXPECTED/CO_E_* 等失败原因;effect 为 NONE 表示目标拒绝。
         let shell_reported = performed_effect.load(Ordering::Relaxed);
+        let desktop_drop_defer_refresh = desktop_drop_defer_refresh.load(Ordering::Acquire);
+        let desktop_visual_lock = desktop_visual_lock.load(Ordering::Acquire);
+        let shell_offsets_requested = shell_offsets_requested.load(Ordering::Acquire);
         let final_effect = final_drop_effect(effect, shell_reported);
         let name = if final_effect.0 & DROPEFFECT_COPY.0 != 0 {
             "copy"
@@ -68,10 +105,21 @@ pub fn start_drag(paths: Vec<String>) -> DROPEFFECT {
             "none"
         };
         crate::dlog(&format!(
-            "[dragout] DoDragDrop hr=0x{:08x} effect={} performed={} final={}",
-            hr.0 as u32, effect.0, shell_reported, name
+            "[dragout] DoDragDrop hr=0x{:08x} effect={} performed={} final={} desktop_drop_defer_refresh={} desktop_visual_lock={} shell_offsets_requested={}",
+            hr.0 as u32,
+            effect.0,
+            shell_reported,
+            name,
+            desktop_drop_defer_refresh,
+            desktop_visual_lock,
+            shell_offsets_requested
         ));
-        final_effect
+        DragResult {
+            effect: final_effect,
+            release_point: release_point.get().copied(),
+            desktop_drop_defer_refresh,
+            desktop_visual_lock,
+        }
     }
 }
 
@@ -83,11 +131,17 @@ pub struct FileDataObject {
     pub paths: Vec<String>,
     /// Explorer 可通过 CFSTR_PERFORMEDDROPEFFECT 回写真正执行的 COPY/MOVE。
     performed_effect: Arc<AtomicU32>,
+    /// 松开左键后由 IDropSource 写入，确保 CF_HDROP 携带真实屏幕落点。
+    release_point: Arc<OnceLock<POINT>>,
+    /// OLE 开始时的屏幕坐标，作为 Shell 对象组的原点。
+    drag_origin: POINT,
+    /// 记录目标是否读取了 Shell 原生对象位置格式。
+    shell_offsets_requested: Arc<AtomicBool>,
 }
 
 /// 构造 CF_HDROP 全局内存块:DROPFILES 头 + 宽字符路径序列(每段 0 结尾,整体双 0 结尾)。
 /// 返回的 HGLOBAL 由接收方 ReleaseStgMedium 释放。
-unsafe fn build_hdrop(paths: &[String]) -> Result<HGLOBAL> {
+unsafe fn build_hdrop(paths: &[String], drop_point: POINT) -> Result<HGLOBAL> {
     let mut buf: Vec<u16> = Vec::new();
     for p in paths {
         buf.extend(p.encode_utf16());
@@ -104,8 +158,10 @@ unsafe fn build_hdrop(paths: &[String]) -> Result<HGLOBAL> {
     }
     let df = DROPFILES {
         pFiles: size_of::<DROPFILES>() as u32,
-        pt: POINT { x: 0, y: 0 },
-        fNC: BOOL(0),
+        pt: drop_point,
+        // TRUE 表示 pt 是屏幕坐标。此前固定的 (0,0)+客户端坐标会让 Shell
+        // 无法从 CF_HDROP 取得本次真实落点。
+        fNC: BOOL(1),
         fWide: BOOL(1), // 宽字符路径
     };
     std::ptr::copy_nonoverlapping(
@@ -118,6 +174,27 @@ unsafe fn build_hdrop(paths: &[String]) -> Result<HGLOBAL> {
         (ptr as *mut u8).add(size_of::<DROPFILES>()),
         payload,
     );
+    let _ = GlobalUnlock(hg);
+    Ok(hg)
+}
+
+/// CFSTR_SHELLIDLISTOFFSET:第一个 POINT 是对象组左上角的屏幕坐标，后续 POINT
+/// 是各对象相对组原点的位置。栅栏当前一次只拖一个条目，因此相对位置为 (0,0)。
+unsafe fn build_shell_offsets(path_count: usize, group_origin: POINT) -> Result<HGLOBAL> {
+    if path_count == 0 {
+        return Err(Error::from_hresult(E_INVALIDARG));
+    }
+    let mut points = Vec::with_capacity(path_count + 1);
+    points.push(group_origin);
+    points.resize(path_count + 1, POINT::default());
+    let byte_len = points.len() * size_of::<POINT>();
+    let hg = GlobalAlloc(GHND, byte_len)?;
+    let ptr = GlobalLock(hg);
+    if ptr.is_null() {
+        let _ = GlobalFree(Some(hg));
+        return Err(Error::from_hresult(E_UNEXPECTED));
+    }
+    std::ptr::copy_nonoverlapping(points.as_ptr() as *const u8, ptr as *mut u8, byte_len);
     let _ = GlobalUnlock(hg);
     Ok(hg)
 }
@@ -144,9 +221,20 @@ fn performed_drop_effect_format() -> FORMATETC {
     }
 }
 
+fn shell_idlist_offset_format() -> FORMATETC {
+    FORMATETC {
+        cfFormat: unsafe { RegisterClipboardFormatW(CFSTR_SHELLIDLISTOFFSET) as u16 },
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0 as u32,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    }
+}
+
 fn format_at(direction: u32, pos: u32) -> Option<FORMATETC> {
     match (direction, pos) {
         (1, 0) => Some(hdrop_format()),
+        (1, 1) => Some(shell_idlist_offset_format()),
         (2, 0) => Some(performed_drop_effect_format()),
         _ => None,
     }
@@ -154,7 +242,7 @@ fn format_at(direction: u32, pos: u32) -> Option<FORMATETC> {
 
 fn format_count(direction: u32) -> u32 {
     match direction {
-        1 => 1,
+        1 => 2,
         2 => 1,
         _ => 0,
     }
@@ -167,7 +255,7 @@ fn is_supported_get_format(fmt: &FORMATETC) -> bool {
     {
         return false;
     }
-    fmt.cfFormat == CF_HDROP.0
+    fmt.cfFormat == CF_HDROP.0 || fmt.cfFormat == shell_idlist_offset_format().cfFormat
 }
 
 fn is_supported_set_format(fmt: &FORMATETC) -> bool {
@@ -248,7 +336,17 @@ impl IDataObject_Impl for FileDataObject_Impl {
             if !is_supported_get_format(&fmt) {
                 return Err(Error::from_hresult(DATA_E_FORMATETC));
             }
-            let hg = build_hdrop(&self.paths)?;
+            let hg = if fmt.cfFormat == CF_HDROP.0 {
+                let point = self
+                    .release_point
+                    .get()
+                    .copied()
+                    .unwrap_or(self.drag_origin);
+                build_hdrop(&self.paths, point)?
+            } else {
+                self.shell_offsets_requested.store(true, Ordering::Release);
+                build_shell_offsets(self.paths.len(), self.drag_origin)?
+            };
             let mut medium = STGMEDIUM::default();
             medium.tymed = TYMED_HGLOBAL.0 as u32;
             medium.u.hGlobal = hg;
@@ -349,6 +447,7 @@ impl IDataObject_Impl for FileDataObject_Impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::System::SystemServices::MK_CONTROL;
 
     #[test]
     fn advertises_file_paths_and_performed_effect_feedback() {
@@ -356,7 +455,10 @@ mod tests {
 
         assert!(is_supported_get_format(&paths));
         assert!(format_at(1, 0).is_some());
-        assert!(format_at(1, 1).is_none());
+        let offsets = shell_idlist_offset_format();
+        assert!(is_supported_get_format(&offsets));
+        assert_eq!(format_at(1, 1).unwrap().cfFormat, offsets.cfFormat);
+        assert!(format_at(1, 2).is_none());
 
         let performed = performed_drop_effect_format();
         assert!(is_supported_set_format(&performed));
@@ -365,10 +467,45 @@ mod tests {
     }
 
     #[test]
-    fn outgoing_get_formats_leave_effect_choice_to_drop_target() {
-        assert_eq!(format_count(1), 1);
+    fn outgoing_get_formats_include_shell_object_positions() {
+        assert_eq!(format_count(1), 2);
         assert_eq!(format_at(1, 0).unwrap().cfFormat, CF_HDROP.0);
-        assert!(format_at(1, 1).is_none());
+        assert_eq!(
+            format_at(1, 1).unwrap().cfFormat,
+            shell_idlist_offset_format().cfFormat
+        );
+        assert!(format_at(1, 2).is_none());
+    }
+
+    #[test]
+    fn hdrop_contains_the_real_screen_drop_point() {
+        let point = POINT { x: 1234, y: 567 };
+        let paths = vec![r"C:\fence\one.txt".to_string()];
+        let hg = unsafe { build_hdrop(&paths, point) }.unwrap();
+        let ptr = unsafe { GlobalLock(hg) };
+        assert!(!ptr.is_null());
+        let header = unsafe { std::ptr::read_unaligned(ptr as *const DROPFILES) };
+        let stored_point = unsafe { std::ptr::addr_of!(header.pt).read_unaligned() };
+        let stored_fnc = unsafe { std::ptr::addr_of!(header.fNC).read_unaligned() };
+        assert_eq!(stored_point, point);
+        assert!(stored_fnc.as_bool());
+        let _ = unsafe { GlobalUnlock(hg) };
+        let _ = unsafe { GlobalFree(Some(hg)) };
+    }
+
+    #[test]
+    fn shell_offsets_start_with_group_origin_and_keep_item_relative() {
+        let origin = POINT { x: 900, y: 400 };
+        let hg = unsafe { build_shell_offsets(1, origin) }.unwrap();
+        let ptr = unsafe { GlobalLock(hg) } as *const POINT;
+        assert!(!ptr.is_null());
+        assert_eq!(unsafe { std::ptr::read_unaligned(ptr) }, origin);
+        assert_eq!(
+            unsafe { std::ptr::read_unaligned(ptr.add(1)) },
+            POINT::default()
+        );
+        let _ = unsafe { GlobalUnlock(hg) };
+        let _ = unsafe { GlobalFree(Some(hg)) };
     }
 
     #[test]
@@ -382,17 +519,53 @@ mod tests {
             DROPEFFECT_MOVE
         );
     }
+
+    #[test]
+    fn desktop_move_fast_path_keeps_ctrl_on_the_normal_explorer_path() {
+        assert!(desktop_move_fast_path_modifiers_allowed(
+            MODIFIERKEYS_FLAGS(0)
+        ));
+        assert!(desktop_move_fast_path_modifiers_allowed(MK_SHIFT));
+        assert!(!desktop_move_fast_path_modifiers_allowed(MK_CONTROL));
+        assert!(!desktop_move_fast_path_modifiers_allowed(
+            MODIFIERKEYS_FLAGS(MK_CONTROL.0 | MK_SHIFT.0)
+        ));
+    }
 }
 
 /// 拖拽过程控制:Esc 取消;松开左键 → 落下;GiveFeedback 用 OLE 默认光标。
-#[implement(IDropSource)]
-pub struct FileDropSource;
+#[implement(IDropSource, IDropSourceNotify)]
+pub struct FileDropSource {
+    release_point: Arc<OnceLock<POINT>>,
+    desktop_drop_defer_refresh: Arc<AtomicBool>,
+    allow_desktop_move_fast_path: bool,
+    current_target: AtomicUsize,
+    desktop_visual_lock: Arc<AtomicU64>,
+}
 
 impl IDropSource_Impl for FileDropSource_Impl {
     fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
         if fescapepressed.as_bool() {
             DRAGDROP_S_CANCEL
         } else if !grfkeystate.contains(MK_LBUTTON) {
+            let mut point = POINT::default();
+            if unsafe { GetCursorPos(&mut point) }.is_ok() {
+                let _ = self.release_point.set(point);
+                let target = HWND(self.current_target.load(Ordering::Acquire) as *mut c_void);
+                if self.allow_desktop_move_fast_path
+                    && desktop_move_fast_path_modifiers_allowed(grfkeystate)
+                    && crate::desktop::drop_position::is_empty_desktop_target(target, point)
+                {
+                    self.desktop_drop_defer_refresh
+                        .store(true, Ordering::Release);
+                    let visual_lock =
+                        crate::desktop::drop_position::begin_desktop_visual_lock(target);
+                    self.desktop_visual_lock
+                        .store(visual_lock, Ordering::Release);
+                    // 这是一次真实的成功落下；源条目已在进入 OLE 前暂时隐藏。
+                    return DRAGDROP_S_DROP;
+                }
+            }
             DRAGDROP_S_DROP
         } else {
             S_OK
@@ -401,5 +574,18 @@ impl IDropSource_Impl for FileDropSource_Impl {
 
     fn GiveFeedback(&self, _dweffect: DROPEFFECT) -> HRESULT {
         DRAGDROP_S_USEDEFAULTCURSORS
+    }
+}
+
+impl IDropSourceNotify_Impl for FileDropSource_Impl {
+    fn DragEnterTarget(&self, hwndtarget: HWND) -> Result<()> {
+        self.current_target
+            .store(hwndtarget.0 as usize, Ordering::Release);
+        Ok(())
+    }
+
+    fn DragLeaveTarget(&self) -> Result<()> {
+        self.current_target.store(0, Ordering::Release);
+        Ok(())
     }
 }
