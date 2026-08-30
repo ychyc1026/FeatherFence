@@ -6,8 +6,9 @@
 `personal/v11-stable` 分支继续维护。个人版以本机日常使用、理解源码和验证改进为目标，不代表
 原作者发布的正式版本，也不会把尚未充分验证的功能直接提交给上游。
 
-首个个人预发行版为 `v0.1.4-personal.1`，仅支持 Windows 10/11 x64。发行附件中的 EXE 未进行
-代码签名，Windows SmartScreen 可能显示未知发布者提示。
+首个个人预发行版为
+[`v0.1.4-personal.1`](https://github.com/ychyc1026/FeatherFence/releases/tag/v0.1.4-personal.1)，仅支持
+Windows 10/11 x64。发行附件中的 EXE 未进行代码签名，Windows SmartScreen 可能显示未知发布者提示。
 
 ## 2. 基线与独立改动
 
