@@ -298,7 +298,7 @@ unsafe extern "system" fn input_wndproc(
 }
 
 /// 弹出单行文本输入对话框,返回输入内容;取消返回 None
-fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
+pub(crate) fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
     static REG: std::sync::Once = std::sync::Once::new();
     REG.call_once(|| unsafe {
         let wc = WNDCLASSW {
@@ -348,8 +348,20 @@ fn prompt_text(parent: HWND, title: &str, initial: &str) -> Option<String> {
         let _ = GetWindowRect(parent, &mut prc);
         // 定位到栅栏附近,但不出屏幕工作区
         let wa = crate::utils::work_area(parent);
-        let dx = (prc.left + (prc.right - prc.left - dw) / 2).clamp(wa.left, wa.right - dw);
-        let dy = (prc.top + (prc.bottom - prc.top - dh) / 3).clamp(wa.top, wa.bottom - dh);
+        let parent_w = prc.right - prc.left;
+        let parent_h = prc.bottom - prc.top;
+        let (dx, dy) = if parent_w <= 1 || parent_h <= 1 {
+            // 托盘命令以隐藏消息窗口为 owner；此时在当前工作区居中。
+            (
+                wa.left + (wa.right - wa.left - dw) / 2,
+                wa.top + (wa.bottom - wa.top - dh) / 2,
+            )
+        } else {
+            (
+                (prc.left + (parent_w - dw) / 2).clamp(wa.left, wa.right - dw),
+                (prc.top + (parent_h - dh) / 3).clamp(wa.top, wa.bottom - dh),
+            )
+        };
 
         let dlg = CreateWindowExW(
             exstyle,

@@ -41,7 +41,6 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL};
 use windows::Win32::UI::Shell::{
     BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, FOLDERID_Desktop,
     FOLDERID_PublicDesktop, SHBrowseForFolderW, SHGetKnownFolderPath, SHGetPathFromIDListW,
@@ -57,12 +56,12 @@ use windows::core::{PCWSTR, w};
 use app::command::{self, AppCommand};
 use config::{Config, FenceCfg, FenceKind};
 use fence::Fence;
-use hotkey::RegisteredHotKey;
+use hotkey::{ParsedHotKey, RegisteredHotKey, parse_hotkey};
 use tray::{
     MENU_AUTOSTART, MENU_CONFIG_DIR, MENU_DESKTOP_AVOID, MENU_DESKTOP_ROLLBACK,
     MENU_DOWNLOAD_ENABLED, MENU_DOWNLOAD_VISIBLE, MENU_EXIT, MENU_GHOST, MENU_NEW_BOX,
-    MENU_NEW_PORTAL, MENU_RELOAD, MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, WM_APP_TRAY, add_tray,
-    make_tray_icon, remove_tray, show_tray_menu,
+    MENU_NEW_PORTAL, MENU_RELOAD, MENU_SWEEP, MENU_TOGGLE_VIS, MENU_ZEN, MENU_ZEN_HOTKEY,
+    WM_APP_TRAY, add_tray, make_tray_icon, remove_tray, show_tray_menu,
 };
 use utils::wstr;
 
@@ -90,7 +89,7 @@ pub struct Global {
     pub download_pending: HashMap<PathBuf, FileCandidate>,
     pub exiting: bool,
     /// 必须在消息窗口销毁前注销的 Zen 全局热键。
-    _zen_hotkey: Option<RegisteredHotKey>,
+    zen_hotkey_registration: Option<RegisteredHotKey>,
     /// 目录监听线程
     pub watchers: Vec<ManagedWatcher>,
 }
@@ -258,6 +257,81 @@ const TID_SWEEP_RETRY: usize = 3;
 const TID_DOWNLOADS: usize = 4;
 const TID_DESKTOP_LAYER: usize = 5;
 const ZEN_HOTKEY_ID: i32 = 1;
+
+fn show_warning(hwnd: HWND, title: &str, message: &str) {
+    let title_w = wstr(title);
+    let message_w = wstr(message);
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            Some(hwnd),
+            PCWSTR(message_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            MB_OK | MB_ICONWARNING,
+        );
+    }
+}
+
+fn register_parsed_zen_hotkey(
+    hwnd: HWND,
+    id: i32,
+    parsed: &ParsedHotKey,
+) -> Result<RegisteredHotKey, String> {
+    RegisteredHotKey::register(hwnd, id, parsed.binding).map_err(|error| {
+        format!(
+            "无法注册全局快捷键 {}，可能已被其他程序占用。\n仍可通过托盘菜单切换 Zen 模式。\n\n系统错误：{error}",
+            parsed.display
+        )
+    })
+}
+
+/// 原子切换 Zen 热键：新组合注册成功后才释放旧组合；失败时保持原配置和旧注册。
+fn reconfigure_zen_hotkey(setting: Option<&str>, persist: bool) -> Result<Option<String>, String> {
+    let parsed = parse_hotkey(setting.unwrap_or(""))?;
+    let normalized = parsed.as_ref().map(|parsed| parsed.display.clone());
+    let already_active = with_global(|g| match (&parsed, &g.zen_hotkey_registration) {
+        (None, None) => true,
+        (Some(parsed), Some(current)) => current.binding() == parsed.binding,
+        _ => false,
+    });
+    if already_active {
+        with_global(|g| {
+            g.config.zen_hotkey = normalized.clone();
+            if persist {
+                config::save(&g.config);
+            }
+        });
+        return Ok(normalized);
+    }
+
+    let new_registration = if let Some(parsed) = &parsed {
+        let candidate_id = with_global(|g| {
+            if g.zen_hotkey_registration.as_ref().map(|hotkey| hotkey.id()) == Some(ZEN_HOTKEY_ID) {
+                ZEN_HOTKEY_ID + 1
+            } else {
+                ZEN_HOTKEY_ID
+            }
+        });
+        Some(register_parsed_zen_hotkey(
+            with_global(|g| g.msg_hwnd),
+            candidate_id,
+            parsed,
+        )?)
+    } else {
+        None
+    };
+
+    let old_registration = with_global(|g| {
+        let old = std::mem::replace(&mut g.zen_hotkey_registration, new_registration);
+        g.config.zen_hotkey = normalized.clone();
+        if persist {
+            config::save(&g.config);
+        }
+        old
+    });
+    drop(old_registration);
+    Ok(normalized)
+}
+
 unsafe extern "system" fn msg_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -269,20 +343,29 @@ unsafe extern "system" fn msg_wndproc(
         if action == windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP as u32
             || action == windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU as u32
         {
-            let (zen, ghost, autostart, download_enabled, download_visible, desktop_avoid) =
-                with_global(|g| {
-                    (
-                        g.zen,
-                        g.config.ghost_mode,
-                        g.config.autostart,
-                        g.config.download_enabled,
-                        g.config.download_box_visible,
-                        g.config.desktop_avoid,
-                    )
-                });
+            let (
+                zen,
+                zen_hotkey,
+                ghost,
+                autostart,
+                download_enabled,
+                download_visible,
+                desktop_avoid,
+            ) = with_global(|g| {
+                (
+                    g.zen,
+                    g.config.zen_hotkey.clone(),
+                    g.config.ghost_mode,
+                    g.config.autostart,
+                    g.config.download_enabled,
+                    g.config.download_box_visible,
+                    g.config.desktop_avoid,
+                )
+            });
             let cmd = show_tray_menu(
                 hwnd,
                 zen,
+                zen_hotkey.as_deref(),
                 ghost,
                 autostart,
                 download_enabled,
@@ -298,12 +381,22 @@ unsafe extern "system" fn msg_wndproc(
         }
         return LRESULT(0);
     }
-    if msg == WM_HOTKEY && wparam.0 == ZEN_HOTKEY_ID as usize {
-        with_global(|g| {
-            g.zen = !g.zen;
-            apply_visibility(g);
+    if msg == WM_HOTKEY {
+        let handled = with_global(|g| {
+            if g.zen_hotkey_registration
+                .as_ref()
+                .is_some_and(|hotkey| hotkey.id() as usize == wparam.0)
+            {
+                g.zen = !g.zen;
+                apply_visibility(g);
+                true
+            } else {
+                false
+            }
         });
-        return LRESULT(0);
+        if handled {
+            return LRESULT(0);
+        }
     }
     if msg == WM_TIMER {
         match wparam.0 {
@@ -457,6 +550,27 @@ fn dispatch_menu(cmd: u32) {
                 apply_visibility(g);
             });
         }
+        MENU_ZEN_HOTKEY => {
+            let (owner, current) =
+                with_global(|g| (g.msg_hwnd, g.config.zen_hotkey.clone().unwrap_or_default()));
+            let Some(input) = fence::prompt_text(owner, "设置 Zen 快捷键（留空禁用）", &current)
+            else {
+                return;
+            };
+            match reconfigure_zen_hotkey(Some(&input), true) {
+                Ok(Some(display)) => {
+                    tray::notify_tip(owner, "Zen 快捷键已更新", &format!("当前：{display}"));
+                }
+                Ok(None) => tray::notify_tip(owner, "Zen 快捷键已禁用", "仍可通过托盘菜单切换"),
+                Err(error) => show_warning(
+                    owner,
+                    "无法设置 Zen 快捷键",
+                    &format!(
+                        "{error}\n\n格式示例：Ctrl+Shift+Z、Alt+F8。\n支持 A-Z、0-9 和 F1-F24；留空表示禁用。"
+                    ),
+                ),
+            }
+        }
         MENU_GHOST => {
             let hwnds = with_global(|g| {
                 g.config.ghost_mode = !g.config.ghost_mode;
@@ -514,6 +628,14 @@ fn dispatch_menu(cmd: u32) {
             c.title_font_size = config::normalize_title_font_size(c.title_font_size);
             fence::set_icon_px(c.icon);
             fence::set_title_font_px(c.title_font_size);
+            if let Err(error) = reconfigure_zen_hotkey(c.zen_hotkey.as_deref(), false) {
+                show_warning(
+                    with_global(|g| g.msg_hwnd),
+                    "无法重新加载 Zen 快捷键",
+                    &error,
+                );
+                c.zen_hotkey = with_global(|g| g.config.zen_hotkey.clone());
+            }
             let old_fences = with_global(|g| {
                 g.config = c;
                 // 保留进程级监听（桌面清扫和 Downloads 接管）；先停止所有栅栏监听，
@@ -657,29 +779,6 @@ fn main() {
     };
     command::init(msg_hwnd);
 
-    let zen_hotkey = match RegisteredHotKey::register(
-        msg_hwnd,
-        ZEN_HOTKEY_ID,
-        MOD_CONTROL | MOD_ALT,
-        'Z' as u32,
-    ) {
-        Ok(hotkey) => Some(hotkey),
-        Err(error) => {
-            dlog(&format!("[hotkey] failed to register Ctrl+Alt+Z: {error}"));
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
-                    Some(msg_hwnd),
-                    w!(
-                        "无法注册全局快捷键 Ctrl+Alt+Z，可能已被其他程序占用。\n仍可通过托盘菜单切换 Zen 模式。"
-                    ),
-                    w!("轻栅栏"),
-                    MB_OK | MB_ICONWARNING,
-                );
-            }
-            None
-        }
-    };
-
     fence::register_class();
     dlog("[main] class registered");
     let mut cfg = config::load();
@@ -696,6 +795,32 @@ fn main() {
             .unwrap_or(32);
     }
     cfg.title_font_size = config::normalize_title_font_size(cfg.title_font_size);
+    let zen_hotkey = match parse_hotkey(cfg.zen_hotkey.as_deref().unwrap_or("")) {
+        Ok(None) => {
+            cfg.zen_hotkey = None;
+            None
+        }
+        Ok(Some(parsed)) => {
+            cfg.zen_hotkey = Some(parsed.display.clone());
+            match register_parsed_zen_hotkey(msg_hwnd, ZEN_HOTKEY_ID, &parsed) {
+                Ok(hotkey) => Some(hotkey),
+                Err(error) => {
+                    dlog(&format!("[hotkey] {error}"));
+                    show_warning(msg_hwnd, "轻栅栏", &error);
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            dlog(&format!("[hotkey] invalid configuration: {error}"));
+            show_warning(
+                msg_hwnd,
+                "Zen 快捷键配置无效",
+                &format!("{error}\n仍可通过托盘菜单重新设置或切换 Zen 模式。"),
+            );
+            None
+        }
+    };
     fence::set_icon_px(cfg.icon);
     fence::set_title_font_px(cfg.title_font_size);
     let vault = config::vault_dir(&cfg);
@@ -739,7 +864,7 @@ fn main() {
             download_seen,
             download_pending: HashMap::new(),
             exiting: false,
-            _zen_hotkey: zen_hotkey,
+            zen_hotkey_registration: zen_hotkey,
             watchers: Vec::new(),
         });
     });
