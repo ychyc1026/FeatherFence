@@ -4,6 +4,9 @@
 
 ![FeatherFences 效果图](docs/screenshot.jpg)
 
+> 当前仓库同时维护个人增强分支与预发行版。与原仓库的关系、改动范围、验证状态和已知限制见
+> [`docs/personal-fork.md`](docs/personal-fork.md)。
+
 ## ✨ 特性
 
 - **透明半透明栅栏** —— 分层窗口 (`WS_EX_LAYERED` + `UpdateLayeredWindow` 逐像素 Alpha),背景半透明面板直透桌面。无磨砂、无 DWM 特效,整幅替换每帧提交,不残留拖影。
